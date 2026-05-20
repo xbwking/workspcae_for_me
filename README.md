@@ -11,6 +11,8 @@ This repository contains a code-level feasibility and design document for infere
 ## Document
 
 - [Ascend verl 前置介绍讲稿](docs/verl_ascend_intro_speech.md)
+- [Ascend verl 前置介绍 PPT](docs/ascend_verl_intro_deck.pptx)
+- [Ascend verl 前置介绍 PPT 预览图](docs/ascend_verl_intro_deck_preview.png)
 - [verl Ascend 支持版本推理优化代码级设计文档](docs/verl_ascend_supported_code_level_design.md)
 - [verl Ascend 推理优化设计详细讲稿](docs/verl_ascend_supported_design_speech.md)
 
