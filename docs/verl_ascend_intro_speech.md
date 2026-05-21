@@ -1,8 +1,10 @@
-# Ascend verl 前置介绍讲稿
+# Ascend verl 系统介绍讲稿
 
-大家好，在正式讲我们后面的推理优化设计之前，我想先用一段时间把背景铺一下，也就是先讲清楚：verl 是什么，Ascend 版本的 verl 是什么，它在强化学习训练里到底怎么工作，以及我们为什么会从推理性能优化这个角度切入。
+大家好，今天这部分我主要讲 Ascend verl 这个系统本身。
 
-这部分内容的目标不是讲某一个具体优化点，而是先让大家有一个共同的架构认知。只有先理解 verl 里面训练、推理、调度、通信、数据流是怎么串起来的，后面再看我们提出的异步参数同步、IPC 权重传输、Ray 调度优化和 TransferQueue，就会更容易理解为什么这些点是关键路径。
+我会先把几个问题讲清楚：verl 是什么，Ascend 版本的 verl 和普通 GPU 版本有什么区别，它在强化学习后训练里面怎么工作，训练侧、推理侧、调度侧和数据侧是怎么串起来的。
+
+这部分的目标是建立一个共同的系统视角。因为 Ascend verl 不是一个单独的训练框架，也不是一个单独的推理服务，它是把大模型 RL 后训练里的训练、推理、通信、调度和数据流都组织起来的一套系统工程。
 
 我会按六个部分来讲。
 
@@ -16,7 +18,7 @@
 
 第五，Ascend 版本里的推理链路和权重同步链路怎么工作。
 
-第六，我们团队为什么要在框架层做推理性能优化。
+第六，Ascend verl 运行时有哪些典型系统压力点。
 
 ---
 
@@ -37,6 +39,18 @@ verl 可以理解成一个面向大模型后训练的强化学习框架。它主
 一个是 critic，在 PPO 这类算法里用于估计 value。
 
 还有一个是 reward model 或 reward function，用来给生成结果打分。
+
+如果对应到第二页这张图，可以把它理解成一个闭环。
+
+最左边是 prompt batch，也就是输入数据，通常会被包装成 verl 内部的 DataProto。
+
+然后进入 rollout。rollout 会调用 vLLM 或 SGLang 这类推理引擎，用当前 actor 策略模型生成 response。
+
+生成结果出来以后，会进入 reward、reference 和 critic 相关计算。reward 负责打分，reference 通常用于 KL 约束，critic 在 PPO 这类算法里用于 value 估计。
+
+这些结果会回到 trainer，trainer 计算 advantage、loss，然后更新 actor 参数。
+
+actor 更新完以后，新权重还要同步回 rollout，这样下一轮生成才会使用新的策略模型。
 
 所以 RL 训练的复杂点在于，它既有训练，又有推理；既有模型参数更新，又有大规模生成；既有 GPU/NPU 计算，又有 Ray 调度、数据流转和模型权重同步。
 
@@ -160,7 +174,7 @@ reward 可以是一个模型，也可以是一个函数。比如数学题、代�
 
 第八个是 checkpoint engine。
 
-这个组件和我们后面的优化强相关。它负责把训练侧 actor 的最新权重同步给 rollout 推理侧。不同硬件和部署模式下，它可以有不同 backend，比如 naive、nccl、hccl、nixl 等。
+这个组件负责把训练侧 actor 的最新权重同步给 rollout 推理侧。不同硬件和部署模式下，它可以有不同 backend，比如 naive、nccl、hccl、nixl 等。
 
 ---
 
@@ -210,13 +224,13 @@ bucket 太小，通信次数多；bucket 太大，可能占用过多 HBM，甚�
 
 清理 cache 可以保证一致性，但会造成同步后推理冷启动。
 
-这些点就是我们后面推理优化设计的主要切入点。
+这些点不是某一个单独模块的问题，而是 Ascend verl 运行时自然会出现的系统压力来源。
 
 ---
 
-第六部分，讲为什么我们要做框架层推理性能优化。
+第六部分，讲 Ascend verl 的系统压力点。
 
-在大模型 RL 训练里，推理侧不是一个附属模块，它往往是端到端训练效率的核心。
+在大模型 RL 训练里，推理侧不是一个附属模块，它往往会影响整个训练 step 的节奏。
 
 原因有三个。
 
@@ -232,7 +246,7 @@ actor 更新以后，rollout 侧要拿到新权重。这个同步频率越高，
 
 SFT 的数据相对固定，训练 batch 比较直接；RL 训练里，数据是不断生成出来的。生成结果、reward、log prob、advantage、sample metadata 都要在多个 worker 之间流转。这里很容易出现 Ray 调度、序列化、object store 和队列瓶颈。
 
-所以如果我们只看单个推理 kernel，可能看不到系统瓶颈。真正影响端到端效率的，是整个框架层链路：
+所以如果只看单个推理 kernel，可能看不到完整问题。真正影响端到端效率的，是整个系统链路：
 
 rollout server 怎么接请求；
 
@@ -250,33 +264,17 @@ Ray actor 是否成为单点；
 
 数据面是否还在走 cloudpickle。
 
-这些都属于推理性能团队可以做、也应该做的框架层优化。
+这些共同构成了 Ascend verl 的系统压力点。
 
-所以后面的优化设计，不是凭空提出几个点，而是围绕这个链路展开。
+第一类压力是 rollout 生成重。长 response、多采样、decode 阶段和 KV cache 都会占用大量 NPU 资源。
 
-我们要做的事情可以概括成一句话：
+第二类压力是权重同步频繁。actor 每次更新后，rollout 都要拿到新权重，大模型权重越大，同步成本越明显。
 
-把 Ascend verl 里训练和推理之间的阻塞链路、重序列化链路、单点调度链路，尽量改成异步化、批量化、引用化和可观测化。
+第三类压力是数据流复杂。sample、reward、logprob、metadata 会在多个 worker 之间流转，数据量和对象数量都不小。
 
-更具体一点，就是四个方向。
+第四类压力是 Ray 控制面压力。短样本、高频 RPC、actor mailbox 和队列都会影响调度稳定性。
 
-第一，参数同步异步化。
-
-把现在的大停顿式权重同步，逐步改成 drain commit 和 prefetch commit。
-
-第二，权重传输高效化。
-
-把现有 bucket IPC 路径做强，减少 fallback，减少 clone，支持大 tensor 分片。
-
-第三，Ray 调度轻量化。
-
-把单 MessageQueue、逐 sample RPC，改成批量 get、分片 queue 和更合理的背压策略。
-
-第四，数据流引用化。
-
-把 rollout sample 的大 tensor 从 Ray cloudpickle 中拿出来，用 SampleRef 和 TransferQueue 这类机制，让 Ray 只传 metadata。
-
-这就是我们后面设计文档要展开的主要内容。
+所以理解 Ascend verl，不能只看一个模型 forward，也不能只看一个通信算子，而要看训练、推理、权重同步、样本回传和 Ray 调度共同组成的闭环。
 
 ---
 
@@ -286,9 +284,9 @@ verl 是一个大模型后训练的 RL 编排框架，它把 actor、rollout、r
 
 Ascend 版本的 verl，是这套框架在昇腾 NPU 环境上的适配，它涉及 CANN、HCCL、torch_npu、vLLM-Ascend、SGLang Ascend backend，以及 NPU 上的通信和性能调优。
 
-在 RL 训练流程里，rollout 推理不是边缘模块，而是核心性能路径。训练侧更新参数之后，推理侧必须同步权重；rollout 生成的样本也必须高效回传给 trainer。
+在 RL 训练流程里，rollout 推理不是边缘模块，而是训练闭环里的核心环节。训练侧更新参数之后，推理侧必须同步权重；rollout 生成的样本也必须回传给 trainer。
 
-因此，我们后面要讲的优化，本质上都是围绕这条路径：
+因此，Ascend verl 的主线可以概括成这条路径：
 
 训练更新参数；
 
@@ -300,8 +298,6 @@ Ascend 版本的 verl，是这套框架在昇腾 NPU 环境上的适配，它涉
 
 训练继续更新。
 
-我们希望通过框架层优化，让这条路径更少阻塞、更少复制、更少 Python 序列化、更少 Ray 单点压力，并且更容易观测和调优。
+理解了这条路径，就能理解 Ascend verl 为什么是一个系统问题：它既要让训练侧持续更新，也要让推理侧持续生成，还要让权重、样本和调度状态在不同 worker 之间正确流动。
 
-这就是我们为什么要做 Ascend verl 推理侧优化的背景。
-
-接下来，我会进入具体设计：基于当前 Ascend 支持的 verl 代码，分析哪些方案可落地，哪些方案需要降级，以及我们团队最应该优先做哪些优化。
+这就是 Ascend verl 的整体工作方式。
