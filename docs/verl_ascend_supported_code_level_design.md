@@ -3,6 +3,7 @@
 日期：2026-05-20  
 工作目录：`/Users/xiongbowen/Documents/pink's_project`  
 Ascend 支持基线：`verl-project/verl@4045d67063052dcb800c918c107b8d5a87046006`
+复核日期：2026-06-02
 
 ## 0. 结论先行
 
@@ -18,6 +19,44 @@ Ascend 支持基线：`verl-project/verl@4045d67063052dcb800c918c107b8d5a8704600
 - `docker/ascend/Dockerfile.ascend_8.5.2_a3_qwen3-5` 使用 CANN `8.5.2`、vLLM `v0.18.0`、vLLM-Ascend commit `54879467c41784a446aa5b486a391d9bfbf488fa`、`torch==2.9.0`、`torch_npu==2.9.0`，并在安装 verl 时执行 `git checkout 4045d67063052dcb800c918c107b8d5a87046006`。
 - `docker/ascend/Dockerfile.ascend_8.5.2_a2_qwen3-5` 同样固定到该 verl commit。
 - `docs/ascend_tutorial/get_start/install_guidance.rst` 指向 vLLM/vLLM-Ascend `v0.18.0`，同时说明 Ascend IPC 需要 HDK `>=25.3.rc1` 和 CANN `>=8.3.RC1`。
+
+### 0.1 2026-06-02 代码复核后的修正结论
+
+本次按当前本地源码重新核对后，原设计方向总体合理，但需要明确三个边界：
+
+1. **HCCL backend 首先是可用性 bug，不是优化项。**  
+   `CheckpointEngineConfig` 注释和 checkpoint engine README 都把 `hccl` 列为 Ascend 后端，但 `HCCLCheckpointEngine` 实际注册成 `"nccl"`。这会导致 `backend=hccl` 不能按预期实例化，并且可能覆盖 NCCL backend 注册。
+
+2. **异步权重同步可做，但不能直接宣称 NPU 通信流与推理计算“完全重叠”。**  
+   当前 HCCL engine 已有双 buffer，但 `BroadcastOperation.__init__()` 立即调用 `_run()`；`_run()` 内直接做 ZMQ metadata 传输和 `pyhccl.broadcast()`。这说明当前实现不是后台线程/异步 NPU stream。可落地路线应先做 `prefetch -> commit` 的框架级异步，再通过 profile 验证 HCCL 是否能绑定独立 stream。
+
+3. **同节点零拷贝权重共享不能作为近期生产承诺。**  
+   当前 vLLM rollout 的 IPC 是“bucket 传输 IPC”，不是“推理长期挂载训练权重”。receiver 在 IPC 路径会 `clone()`，shared memory 路径会 `.to(device)`，所以最终推理引擎仍拥有自己的权重副本。第一阶段应优化 bucket IPC/SHM 传输和指标，ACL IPC handle 只做独立通信 buffer PoC。
+
+因此，本文推荐的生产落地顺序是：
+
+1. 修复 HCCL registry + 增加权重同步全链路指标。
+2. 优化现有 bucket IPC/SHM、metadata、非连续 tensor 和大 tensor 分片。
+3. 在 fully_async 路径做 MessageQueue 批量化/分片，降低 Ray RPC 和 cloudpickle 压力。
+4. 做 `drain_then_commit`，再做 `prefetch_then_commit`。
+5. TransferQueue/SampleRef 作为数据面长期方案，先接最大 tensor 字段，不一次性替换全部样本对象。
+
+### 0.2 关键代码证据表
+
+| 结论 | 当前代码证据 | 对设计的影响 |
+| --- | --- | --- |
+| HCCL registry 注册错误 | `verl/checkpoint_engine/hccl_checkpoint_engine.py:96` 为 `@CheckpointEngineRegistry.register("nccl")`；`verl/checkpoint_engine/nccl_checkpoint_engine.py:96` 也注册 `"nccl"` | P0 修复；所有 HCCL 优化必须先保证 `backend=hccl` 命中正确 engine |
+| config/README 期望存在 `hccl` backend | `verl/workers/config/rollout.py:158` 注释包含 `naive, nccl, nixl, hccl`；`verl/checkpoint_engine/README.md:19` 将 `hccl` 标为 Ascend NPU 后端 | 说明 registry bug 会影响真实配置，不是文档命名问题 |
+| 当前权重同步是全局暂停式 | `CheckpointEngineManager.update_weights()` 在 `base.py:416-445` 执行 abort、sleep、build PG、update、finalize、wake、resume | `drain_then_commit` 和 `prefetch_then_commit` 都要改 manager/replica 协议 |
+| cache 抽象已有但 HCCL 未实现 | `CheckpointEngineWithCache` 在 `base.py:180-194`，只定义 `get_weights()` 抽象 | 可复用抽象，但必须新增 cached HCCL engine 和 cache store |
+| HCCL 双 buffer 不是异步后台传输 | `BroadcastOperation.__init__()` 在 `hccl_checkpoint_engine.py:73` 直接 `_run()`；`_run()` 在 `:76-85` 同步 ZMQ + broadcast | 不能把现状描述成异步；NPU stream 只作为能力探测后的增强 |
+| HCCL bucket 仍有强同步点 | `send_weights()` 在 `hccl_checkpoint_engine.py:252-253`、`:286-287` 调用 `torch.npu.synchronize()` | bucket overlap 收益需要 profile，不应承诺“完全重叠” |
+| vLLM IPC/SHM fallback 已存在 | `vllm_rollout.py:100-107` 根据 `is_support_ipc()` 设置 `use_shm` 并 warning | 可加指标和环境版本打印；不需要重造 fallback |
+| IPC receiver 会复制 | `bucketed_weight_transfer.py:246-253`：IPC 路径 `clone()`，SHM 路径 `.to(device)` | 当前不是零拷贝权重共享；clone/to(device) 时间应纳入指标 |
+| bucket 大 tensor 会 assert | `bucketed_weight_transfer.py:135-139` TODO 和 assert 要求增大 bucket | 大 tensor 分片是直接可落地优化 |
+| fully_async 单队列单样本 RPC | `MessageQueue` 为单 actor：`message_queue.py:26`；`get_sample()` 单样本：`:85-103`；同步客户端：`:228-230` | 批量 get、queue shard 是低风险优化 |
+| fully_async 整样本 cloudpickle | rollouter `fully_async_rollouter.py:510-512` dumps；trainer `fully_async_trainer.py:246` 逐个 get，`:276` loads | SampleRef/TransferQueue 方向成立，但作用范围主要是 experimental fully_async 路径 |
+| TransferQueue 是外部集成入口 | `main_ppo.py:69-72` 设置 `TRANSFER_QUEUE_ENABLE=1`；`docs/data/transfer_queue.md` 描述外部包；本地无 `verl/experimental/transfer_queue` 目录 | 文档不能假设当前 commit 内已有完整 TransferQueue 实现 |
 
 ## 1. 现有权重同步链路
 
@@ -95,6 +134,38 @@ class HCCLCheckpointEngine(CheckpointEngine):
 1. `prefetch_weights_to_cache(version)`：训练侧把新权重异步广播/传输到 rollout 侧影子缓存，不中断正在生成的请求。
 2. `commit_cached_weights(version)`：在 replica 请求边界或 staleness 达到阈值时暂停接收新请求，短暂停机把缓存权重加载进推理引擎。
 
+### 版本与状态机
+
+新增 `param_version` 是该方案能否落地的关键。建议所有 rollout 请求、样本和权重 cache 都带版本字段：
+
+```python
+@dataclass
+class ParamVersionState:
+    current_committed: int
+    latest_prefetched: int | None
+    in_commit: bool
+    max_staleness: int
+```
+
+状态转换：
+
+```mermaid
+stateDiagram-v2
+    [*] --> COMMITTED_V0
+    COMMITTED_V0 --> PREFETCHING_V1: trainer update done
+    PREFETCHING_V1 --> READY_V1: cache receive complete
+    READY_V1 --> COMMITTING_V1: request boundary or staleness trigger
+    COMMITTING_V1 --> COMMITTED_V1: server update_weights done
+    COMMITTING_V1 --> COMMITTED_V0: update failed, rollback cache
+```
+
+样本侧约束：
+
+- rollouter 生成时记录 `sample.param_version=current_committed`。
+- trainer 消费样本时检查 `current_trainer_version - sample.param_version <= max_staleness`。
+- 超过阈值的样本进入 `stale_drop` 指标，不直接混入训练 batch。
+- `prefetch` 失败不能影响当前已 commit 权重；只有 `READY` 状态允许进入 `commit`。
+
 ### 推荐代码改造
 
 新增类：
@@ -111,12 +182,37 @@ class HCCLCheckpointEngine(CheckpointEngine):
   - value：按 bucket 保存的 NPU tensor 或 pinned CPU/SHM fallback。
   - 状态：`RECEIVING -> READY -> COMMITTED -> RELEASED`
   - 支持 `max_cached_versions=1`，默认只保留最新版本，避免 HBM 爆炸。
+  - bucket 级 manifest：
+
+```python
+@dataclass
+class CachedWeightBucket:
+    version: int
+    bucket_id: int
+    is_last: bool
+    buffer: torch.Tensor
+    tensor_meta: dict[str, TensorMeta]
+    storage: Literal["npu", "cpu_pinned", "shm"]
+```
 
 改造 `CheckpointEngineManager`：
 
 - 新增 `prefetch_weights(global_steps)`，只创建 worker group、build process group、触发 CE 接收并写 cache，不调用 `abort_all_requests()` 和 `sleep_replicas()`。
 - 新增 `commit_weights(global_steps)`，在 rollout request 边界调用 `server_adapter.update_weights(checkpoint_engine.get_weights(version))`。
 - 对 fully_async：`FullyAsyncTrainer._fit_update_weights()` 先触发 prefetch；`FullyAsyncRollouter.reset_staleness()` 或 `_should_pause_generation` 满足条件时 commit。
+
+更稳妥的第一版不直接删除当前 `update_weights()`，而是在配置中增加策略：
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    checkpoint_engine:
+      sync_policy: abort_all | drain_then_commit | prefetch_then_commit
+      max_cached_versions: 1
+      max_staleness: 1
+```
+
+默认仍为 `abort_all`，确保生产回退路径不变。
 
 关键伪代码：
 
@@ -147,6 +243,8 @@ async def commit_weights(self, global_steps: int):
 - 算法侧 off-policy 风险由 `staleness_threshold` 控制。建议默认 `0.1-0.5`，大模型吞吐压测通过后再增大。
 - 影子缓存占 HBM。千亿模型不应缓存全量两份权重，推荐按 bucket 或 layer 分段 commit。
 - vLLM/SGLang 对在线更新权重的一致性要求不同，需要分别做 server adapter 层验证。
+- 如果 `free_cache_engine=True` 是为了给训练侧释放 HBM，则 prefetch 不能绕过 sleep/wake 直接持有额外 HBM。此时应使用 CPU pinned/shm cache，或只缓存当前 commit window 的少量 bucket。
+- 如果使用 GRPO/DAPO 多 response per prompt，必须按 prompt group 维度处理 staleness，避免同一组 response 混用不同 actor 版本后影响 group normalization。
 
 ## 3. 方案 3.2：同节点零拷贝权重共享与显存重映射
 
@@ -175,11 +273,67 @@ async def commit_weights(self, global_steps: int):
 - 对 NPU 环境明确要求 HDK `>=25.3.rc1`、CANN `>=8.3.RC1`。
 - 不改 vLLM 权重所有权，仅降低传输延迟和 host memory 峰值。
 
+第一阶段的具体改动建议：
+
+1. **路径可观测性**
+
+```python
+weight_transfer/path = "ipc" | "shm"
+weight_transfer/bucket_count
+weight_transfer/bucket_bytes
+weight_transfer/sender_copy_ms
+weight_transfer/receiver_clone_ms
+weight_transfer/receiver_to_device_ms
+weight_transfer/metadata_pickle_ms
+```
+
+2. **大 tensor 分片**
+
+当前 `BucketedWeightSender` 在单个 tensor 大于 bucket 时直接 assert。建议新增 chunk manifest，避免用户只能增大 bucket：
+
+```python
+{
+  "name": "model.embed_tokens.weight",
+  "chunk_id": 3,
+  "num_chunks": 16,
+  "shape": [151936, 4096],
+  "dtype": "bfloat16",
+  "global_offset_bytes": 805306368,
+  "bucket_offset": 0,
+  "nbytes": 268435456
+}
+```
+
+receiver 侧有两种实现：
+
+- **低风险版**：按 chunk 重组完整 tensor，再交给 `update_weights`。实现简单，但会增加一次内存峰值。
+- **高收益版**：server adapter 支持 chunk load，把分片直接写入目标参数 slice，避免重组复制。需要和 vLLM-Ascend/SGLang 更新接口联调。
+
+3. **metadata 编码替换**
+
+`send_pyobj/recv_pyobj` 方便但隐含 pickle。建议替换为 msgpack/JSON manifest：
+
+```python
+socket.send_json(manifest)
+```
+
+shape 用 list，dtype 用字符串，offset/nbytes 用 int。这样可以降低 Python 对象序列化的不确定性，也更方便日志和调试。
+
 第二阶段：PoC 原生 ACL IPC handle。
 
 - 新增 `AscendIpcHandleProvider`，封装 `aclrtIpcGetMemHandle` / `aclrtIpcOpenMemHandle` / close 逻辑。
 - 只对独立 bucket buffer 做 PoC，不直接映射模型参数。
 - 先验证生命周期、安全隔离、进程退出清理、跨 device 可见性、torch_npu allocator 兼容性。
+
+PoC 验证清单：
+
+| 验证点 | 必须验证的问题 |
+| --- | --- |
+| handle 生命周期 | sender 退出、receiver 未 close、重复 open/close 是否泄漏 |
+| allocator 兼容 | ACL open 得到的地址能否安全包装成 torch_npu tensor 或只能走 C 扩展 copy |
+| 跨卡可见性 | 同节点同卡、同节点跨卡、跨节点分别是否支持 |
+| 异常恢复 | Ray actor 重启后旧 handle 是否可清理 |
+| 安全隔离 | 进程间是否存在越权访问或 stale handle 复用风险 |
 
 第三阶段：研究长期共享权重。
 
@@ -194,6 +348,7 @@ async def commit_weights(self, global_steps: int):
 
 - 不建议把训练参数原地暴露给推理进程长期读取。训练 optimizer step 与推理读权重之间会出现一致性问题。
 - 不建议承诺 50% HBM 节省。当前代码 clone 后仍保留推理权重副本，真实收益主要是传输链路和 host memory 峰值。
+- 不建议绕过 vLLM-Ascend/SGLang 的权重 update API 直接改底层 tensor storage，除非推理引擎明确支持外部 storage ownership。否则很容易破坏 KV cache、CUDA/NPU graph、参数别名和 dtype cast 逻辑。
 
 ## 4. 方案 3.3：分布式调度引擎优化
 
@@ -226,6 +381,8 @@ RAY_event_stats=false
 
 实际变量名需按目标 Ray 版本复核，避免无效配置静默失效。更稳妥方式是在启动日志里打印 Ray version 和生效 env。
 
+注意：这些环境变量只能减少 Ray 控制面历史事件/日志压力，不能替代架构改造。对当前 fully_async 代码来说，真正的热点仍是单 actor queue、逐样本 RPC 和整样本 cloudpickle。
+
 2. MessageQueue 分片
 
 将单 actor queue 改为 shard queue：
@@ -248,7 +405,56 @@ flowchart LR
 - `FullyAsyncTrainer._get_samples_from_queue()` 从 `QueueSampler` 批量取 metadata。
 - 每个 shard 内保留 `asyncio.Condition`，但 get 接口改成 `get_samples(max_n)`，减少 Ray RPC 次数。
 
-3. TransferQueue 替换整样本队列
+接口建议：
+
+```python
+@dataclass
+class QueueStats:
+    queue_size: int
+    produced: int
+    consumed: int
+    dropped: int
+
+async def put_samples(self, samples: list[Any]) -> QueueStats:
+    ...
+
+async def get_samples(self, max_n: int, timeout_ms: int = 1000) -> tuple[list[Any], QueueStats]:
+    ...
+```
+
+Trainer 当前 `_get_samples_from_queue()` 是：
+
+```python
+while len(queue_samples) < self.required_samples:
+    sample, queue_len = self.message_queue_client.get_sample_sync()
+```
+
+改造后应变成：
+
+```python
+while len(queue_samples) < self.required_samples:
+    batch, stats = self.message_queue_client.get_samples_sync(
+        max_n=self.required_samples - len(queue_samples),
+        timeout_ms=1000,
+    )
+    queue_samples.extend(batch)
+```
+
+这样 `required_samples=1024` 时，Ray RPC 可从 1024 次下降到几十次以内。
+
+3. 按版本丢弃而不是简单丢 oldest
+
+当前 `MessageQueue` 满时直接 `popleft()`。在 RL 里更合理的策略是优先丢弃最旧 `param_version` 的样本：
+
+```yaml
+async_training:
+  queue_drop_policy: oldest_param_version
+  max_queue_staleness: 1
+```
+
+需要 `RolloutSample` 或 `SampleRef` 带上 `param_version`。如果无法取到版本，才回退到 `oldest`。
+
+4. TransferQueue 替换整样本队列
 
 把 Ray queue 中的数据从 `cloudpickle bytes` 改为轻量引用：
 
@@ -265,6 +471,12 @@ SampleRef = {
 ```
 
 Trainer 只通过 Ray 收 metadata，tensor 字段由 TransferQueue storage 传输。
+
+本 commit 的限制：
+
+- `config.transfer_queue.enable` 只在 `main_ppo.py` 设置 `TRANSFER_QUEUE_ENABLE=1`。
+- 文档 `docs/data/transfer_queue.md` 指向外部 `transfer_queue` 包。
+- 本地没有 `verl/experimental/transfer_queue` 目录，因此需要新增 adapter 或引入外部包，不能说“代码已内置完整 TransferQueue”。
 
 ### 预期收益
 
@@ -309,6 +521,13 @@ def iter_transferable_params(named_params):
 
 注意：`contiguous()` 会复制，不应无条件在所有路径开启。建议只在 bucket sender 检测到非连续 tensor 时做，并打指标。
 
+更准确地说，权重侧不是要重新设计“state_dict pickle 传输”，而是要把进入 checkpoint engine 的 named tensor 生成器规范化：
+
+- 保证 `detach()`，避免 autograd graph 被错误保留。
+- 保证 sparse/quantized/非标准 storage 有明确报错或转换策略。
+- 非连续 tensor 只在 bucket copy 前按需 contiguous，并记录额外 copy bytes。
+- dtype 不强制统一 cast。当前 bucket sender 注释已经说明部分参数如 MoE gate 可能需要保持 fp32；强制 cast 会影响正确性或精度。
+
 2. WeightManifest
 
 不要用 pickle 发送复杂对象，改为 JSON/msgpack 级 metadata：
@@ -326,6 +545,8 @@ def iter_transferable_params(named_params):
 
 数据面只传 uint8 bucket。HCCL 当前用 ZMQ `send_pyobj` 传 bucket meta，可替换成 manifest 编码，降低 Python pickle 风险。
 
+manifest 中 dtype 建议使用稳定字符串，例如 `"torch.bfloat16"` 或 `"bfloat16"`，不要直接传 `torch.dtype` 对象；shape 使用 list，不传 `torch.Size` 对象。这样可以避免 msgpack/JSON 与 torch 对象之间的兼容问题。
+
 3. RolloutSample 字段级 TransferQueue
 
 把 `RolloutSample` 拆成：
@@ -336,9 +557,23 @@ def iter_transferable_params(named_params):
 
 Trainer 组 batch 时按字段 fetch，而不是 loads 整个 sample。
 
+首批迁移字段建议只选数据量最大的 tensor 字段：
+
+| 字段 | 迁移原因 | 备注 |
+| --- | --- | --- |
+| `input_ids` | 每个样本必带，长度随 prompt/response 增长 | 可和 `responses` 合并存储 |
+| `attention_mask` | token 级 tensor，batch 组装必需 | dtype/shape 简单 |
+| `position_ids` | token 级 tensor | 可选，取决于模型 |
+| `responses` | rollout 输出主体 | 多 response per prompt 时收益最大 |
+| `old_log_probs` / rollout logprob | token 级 float tensor | fully_async 要求 `calculate_log_probs=True` 时收益明显 |
+
+非 tensor 字段如 `uid`、reward extra info、status、length、版本号可以先保留在 Ray metadata 中。
+
 ### 与 Ray Pickle5 的关系
 
 Ray 对 numpy/arrow/tensor 有零拷贝或 plasma/object store 优化，但 Python 对象图越复杂，越容易退化到 cloudpickle。当前 `RolloutSample` 是复合对象，里面包含 `DataProto`、tensor dict、non_tensor_batch、状态字段，直接 cloudpickle 不稳定。更可靠的落地方式是“显式字段化 + 引用传递”。
+
+这里不能把“Ray Pickle5 零拷贝”理解为 NPU HBM 零拷贝。Ray object store 的主要优势在 CPU 共享内存对象；NPU tensor 跨进程仍可能发生 host bounce 或显式 device copy。设计上应以 TransferQueue/存储后端的实际 profile 为准。
 
 ## 6. 分阶段交付计划
 
@@ -393,6 +628,7 @@ Ray 对 numpy/arrow/tensor 有零拷贝或 plasma/object store 优化，但 Pyth
 
 1. `verl/checkpoint_engine/hccl_checkpoint_engine.py`
    - `@CheckpointEngineRegistry.register("nccl")` 改为 `@CheckpointEngineRegistry.register("hccl")`。
+   - 增加防重复注册保护或启动日志，避免 NCCL/HCCL 互相覆盖时无提示。
 
 2. `verl/checkpoint_engine/base.py`
    - 给 `CheckpointEngineManager.update_weights()` 分段计时。
@@ -413,6 +649,66 @@ Ray 对 numpy/arrow/tensor 有零拷贝或 plasma/object store 优化，但 Pyth
 
 6. 新增 `verl/checkpoint_engine/hccl_cached_checkpoint_engine.py`
    - 实现 `CheckpointEngineWithCache`，作为 Phase 2 功能开关。
+
+### 8.1 P0 补丁细化
+
+P0 不建议一次性引入 prefetch/cache。第一批补丁只做“正确命中 + 可观测”：
+
+```python
+# verl/checkpoint_engine/hccl_checkpoint_engine.py
+@CheckpointEngineRegistry.register("hccl")
+class HCCLCheckpointEngine(CheckpointEngine):
+    ...
+```
+
+同时建议修改 registry，使重复注册可见：
+
+```python
+def wrapper(cls):
+    if backend in CheckpointEngineRegistry._registry:
+        logger.warning(
+            "Checkpoint engine backend %s is overwritten: %s -> %s",
+            backend,
+            CheckpointEngineRegistry._registry[backend],
+            cls,
+        )
+    CheckpointEngineRegistry._registry[backend] = cls
+    return cls
+```
+
+如果担心改动影响上游行为，可以先只加单元测试捕捉冲突：
+
+```python
+def test_hccl_backend_registered_when_torch_npu_available():
+    assert "hccl" in CheckpointEngineRegistry._registry
+```
+
+无 NPU CI 环境时，测试可以拆成：
+
+- `test_registry_does_not_overwrite_nccl_by_hccl()`：通过 mock module import 验证 `"nccl"` 和 `"hccl"` 是两个 key。
+- `test_checkpoint_engine_config_accepts_hccl()`：构造 `CheckpointEngineConfig(backend="hccl")` 后调用 registry lookup。
+
+### 8.2 指标命名建议
+
+为了后续对比，建议统一使用这些 metric key：
+
+| 指标 | 含义 |
+| --- | --- |
+| `param_sync/abort_ms` | abort in-flight request 时间 |
+| `param_sync/sleep_ms` | rollout sleep/release 时间 |
+| `param_sync/build_pg_ms` | prepare + build topology + init process group 时间 |
+| `param_sync/send_recv_ms` | trainer send + rollout receive 总时间 |
+| `param_sync/server_update_ms` | vLLM/SGLang adapter update 权重时间 |
+| `param_sync/finalize_ms` | checkpoint engine finalize 时间 |
+| `param_sync/wake_ms` | rollout wake_up 时间 |
+| `param_sync/resume_ms` | resume_generation 时间 |
+| `weight_transfer/path` | `hccl` / `ipc` / `shm` |
+| `weight_transfer/bucket_count` | bucket 数量 |
+| `weight_transfer/metadata_ms` | ZMQ metadata 编解码时间 |
+| `weight_transfer/clone_or_to_device_ms` | receiver 复制时间 |
+| `fully_async_queue/get_rpc_count` | trainer 拉样本 RPC 次数 |
+| `fully_async_queue/cloudpickle_load_ms` | loads 总时间 |
+| `fully_async_queue/stale_drop_count` | 因版本过旧丢弃样本数 |
 
 ## 9. 验证矩阵
 
