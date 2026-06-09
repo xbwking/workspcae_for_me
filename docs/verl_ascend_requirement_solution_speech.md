@@ -1,354 +1,350 @@
 # verl Ascend 推理优化需求与方案设计串讲稿
 
-各位好，今天我主要围绕我们刚刚补充的《verl Ascend 推理优化需求与方案设计》做一次方案串讲。
+各位好，今天我讲的是 verl Ascend 场景下的推理优化需求与方案设计。
 
-这次串讲的重点不是单纯介绍某一个 patch，而是把我们为什么要做这件事、要解决什么问题、方案怎么设计、怎么保证可靠可用，以及后续怎么测试验证，完整地串起来。
+这次串讲我想先说明一下重点。我们不是单纯介绍一个 benchmark，也不是单纯介绍几个代码 patch。我们真正要讲清楚的是：在 Ascend 上跑 verl 的强化学习训练时，推理相关链路为什么会成为性能瓶颈，我们准备从框架层做哪些优化，这些优化哪些能先落地，哪些需要作为后续研究项推进，以及最后怎么证明优化确实有效。
 
-我会按照五个部分展开：
-
-第一部分是需求分析，包括背景、价值和目标。  
-第二部分是场景分析，包括 use case 和约束限制。  
-第三部分是方案设计，包括整体方案、影响分析、交互和任务拆解。  
-第四部分是可靠可用设计，包括冗余和防呆。  
-第五部分是测试建议，也就是后续怎么证明这个方案是有效的。
+我会按照一条比较自然的线来讲。先讲这个系统在做什么，然后讲现在遇到的问题，再讲方案如何设计，最后讲可靠性和测试验证。大家可以先抓住一个核心判断：这套方案不是为了直接承诺某一个点一定提升多少，而是先把链路变得可观测，再做低风险优化，最后用 Ascend 环境下的 benchmark 来确认收益。
 
 ---
 
-## 一、需求分析
+## 需求背景
 
-我们先看需求背景。
+先看背景。
 
-verl 在大模型强化学习训练里，不是一个单纯的训练框架，它同时要协调训练、推理采样、奖励计算、权重同步和样本回流这几条链路。
+verl 在大模型强化学习训练里，不只是一个普通训练框架。它要同时协调训练、推理采样、奖励计算、权重同步和样本回流。也就是说，它的关键路径不是单一的 forward、backward 或 optimizer step，而是一整条训练和推理互相耦合的链路。
 
-尤其在 RLHF、GRPO、PPO 这类场景里，训练侧会不断更新 actor 权重，推理侧又要持续用最新或者较新的 actor 权重去生成 rollout 样本。这个过程天然会有一个矛盾：训练希望尽快更新参数，推理希望持续高吞吐生成样本，而权重同步会打断推理。
+以 GRPO 或 PPO 为例，训练侧会不断更新 actor 模型的权重。rollout 侧又要使用 actor 模型生成 response，拿到样本后再回流给 trainer 做 loss 计算和参数更新。这里就有一个天然矛盾：训练希望 actor 权重尽快更新，推理希望一直持续生成样本，不要停；但权重同步通常会让推理侧暂停。
 
-在 Ascend NPU 环境下，当前支持基线已经具备了一些基础能力，比如 vLLM-Ascend、HCCL checkpoint engine、bucketed IPC 或 shared memory 权重传输、Ray WorkerGroup，以及 fully_async policy。但是从推理性能优化角度看，现有链路还有几个比较明确的问题。
+在 GPU 生态里，这个问题已经很典型。在 Ascend NPU 上，这个问题会更值得关注，因为我们还要同时考虑 HCCL、torch_npu、vLLM-Ascend、Ray 调度、IPC 或 shared memory 权重传输这些组件之间的配合。
 
-第一个问题，是权重同步链路对推理采样存在全局暂停。
+当前 Ascend-supported verl 不是没有基础能力。我们已经能看到 vLLM-Ascend rollout、HCCL checkpoint engine、bucketed IPC / shared memory 权重传输、Ray WorkerGroup，以及 fully_async policy 这些能力。换句话说，系统已经有一条能跑通的基线。
 
-现在 `CheckpointEngineManager.update_weights()` 的流程比较粗，它会串行做 `abort_all_requests`、`sleep`、`build_process_group`、`send/receive/update`、`finalize`、`wake` 和 `resume_generation`。这个流程的好处是安全，能够保证推理侧更新权重的一致性。但是坏处也很明显，它把请求中断、KV cache 释放、process group 构建、权重通信、推理引擎更新、恢复生成这些成本全部暴露到端到端 step 时间里。
+但从推理性能优化团队的角度看，“能跑通”和“能稳定优化”之间还有距离。现在最大的问题不是某一个函数写得慢，而是很多关键耗时点还没有被拆开。比如一次 step 慢了，我们可能知道 `timing_s/step` 增大了，也可能知道 `timing_s/update_weights` 增大了，但很难继续回答：到底是 process group 构建慢，还是 HCCL 传输慢，还是 rollout server 更新慢，还是 Ray 样本回流慢。
 
-也就是说，我们在日志里看到一个 `timing_s/update_weights` 很慢时，其实不知道到底慢在哪里。可能是 HCCL 传输慢，可能是 sleep/wake 慢，可能是 process group 初始化慢，也可能是 rollout server update 权重慢。
+如果没有这种拆解，后续做优化就会很被动。我们可能改了 MessageQueue，但不知道收益有没有被权重同步吞掉；也可能改了权重传输，但端到端 step 没变化，因为真正瓶颈在 rollout generation；还可能看到吞吐提升了，但无法向评审解释收益来源。
 
-第二个问题，是 Ascend HCCL 后端本身存在一个可用性问题。
-
-我们复核代码时发现，当前基线里的 `HCCLCheckpointEngine` 实际注册成了 `"nccl"`，但是配置和文档里期望的是 `"hccl"` backend。这意味着如果用户配置 `backend=hccl`，可能无法正确命中 HCCL engine。同时它还可能和 NCCL backend 的注册产生覆盖风险。
-
-这个问题首先不是性能优化，而是可用性 bug。所有后续基于 HCCL 的优化，都必须先建立在 backend 能正确命中的基础上。
-
-第三个问题，是现有 IPC 和 shared memory 权重传输缺少可观测性。
-
-vLLM rollout 当前已经会根据环境能力选择 IPC 或 shared memory fallback，但是我们看不到它实际走了哪条路径，也看不到每次权重传输有多少 bucket、多少字节、metadata 花了多久、sender copy 花了多久、receiver clone 或者 to device 花了多久。
-
-这会导致性能分析时只能猜。比如一次权重同步很慢，我们不知道是 IPC 没生效退化到了 SHM，还是 bucket 太多，还是 receiver 端 clone 成本太高。
-
-第四个问题，是 fully_async 样本回流路径存在 Ray RPC 和 cloudpickle 压力。
-
-当前 fully_async 的 MessageQueue 是单 Ray Actor。trainer 端逐个调用 `get_sample_sync()` 拉样本，rollouter 端会把整个 rollout sample 做 `cloudpickle.dumps()`，trainer 端再做 `cloudpickle.loads()`。
-
-如果是长 response、多 rollout replica，或者大量短样本场景，瓶颈就不一定在 NPU 上，反而可能在 Ray actor mailbox、Ray GCS、CPU 序列化，以及 object store 上。
-
-第五个问题，是缺少统一 benchmark 来证明优化收益。
-
-只看训练日志里的 `timing_s/step`，我们只能知道整体变快或者变慢，但无法说明收益来自哪里。比如 step 时间下降了，是因为 MessageQueue RPC 下降，还是因为权重同步下降，还是因为 IPC 传输变快，还是因为 NPU 算子侧变化？如果没有统一的耗时拆解 benchmark，这些问题都回答不了。
-
-所以这次需求的核心价值，就是把 verl Ascend 场景里的推理性能优化，从“凭经验判断”，推进到“可度量、可回退、可持续迭代”的工程体系。
-
-具体价值有五点。
-
-第一，提升推理采样吞吐。我们通过减少权重同步期间的推理暂停、减少 Ray RPC 次数、降低样本序列化成本，提升 rollout 生成链路的有效吞吐。
-
-第二，降低大模型权重同步开销。我们对 HCCL、IPC、SHM 权重传输做分段打点，后续就可以针对 bucket 传输、metadata 编码、receiver copy、process group 构建这些子环节做优化。
-
-第三，降低 Ray 调度和队列压力。MessageQueue 批量化、后续分片化，以及 SampleRef 加 TransferQueue 的设计，可以减少大量短生命周期 RPC 对 Ray GCS 和单 actor mailbox 的压力。
-
-第四，提供可证明的优化收益。通过统一 benchmark 输出 `summary.json`、`timing_breakdown.csv` 和 `compare.json`，我们可以对每个优化点给出 baseline 和 patched 的 mean、p50、p95、speedup 和 verdict。
-
-第五，控制生产风险。我们不是一上来就改高风险链路，而是保留默认保守路径，比如 `abort_all` 权重同步策略、SHM fallback、prefix cache 默认清理、同步失败回退旧权重版本。这样可以避免为了性能破坏训练正确性。
-
-接下来讲需求目标。
-
-近期目标有六个。
-
-第一，修复 HCCL backend 注册问题，保证 Ascend 权重同步链路能正确启用。
-
-第二，为权重同步链路补充分段耗时指标，包括 abort、sleep、build process group、send/receive update、finalize、wake、resume。
-
-第三，为 bucketed weight transfer 增加 sender 和 receiver 两侧指标，包括 bucket 数、字节数、metadata 时间、copy 时间和 sync 时间。
-
-第四，在 fully_async MessageQueue 中实现批量 `get_samples(max_n)`，降低 trainer 端逐样本 Ray RPC 开销。
-
-第五，在 fully_async trainer 中记录 queue get RPC 次数和 cloudpickle load 时间。
-
-第六，构建 Ascend timing breakdown benchmark，支持单次运行、结果汇总和 baseline / patched 对比。
-
-中长期目标主要包括：
-
-权重同步从当前的 `abort_all`，逐步演进到 `drain_then_commit`，再到 `prefetch_then_commit`；MessageQueue 做分片；引入 SampleRef 加 TransferQueue，把大 tensor 字段从 Ray cloudpickle 数据面中移出去；研究 ACL IPC handle 在通信 buffer 上的可行性；最后联合 vLLM-Ascend 或 SGLang 验证 prefix / KV cache version 化策略。
-
-这里要强调一点：中长期目标里有些是研究项，比如 ACL IPC 长期零拷贝权重共享，这个不能在近期直接承诺生产收益。近期最稳妥的方向还是修正链路、做指标、做低风险优化，并用 benchmark 证明收益。
+所以这次需求的核心背景可以概括成一句话：Ascend verl 的推理优化要从“能跑”和“凭经验调优”，走向“可度量、可解释、可回退、可持续迭代”。
 
 ---
 
-## 二、场景分析
+## 需求价值
 
-接下来我们看场景分析，也就是这个方案到底服务哪些 use case。
+这件事的价值可以从几个角度看。
 
-第一个 use case，是 Ascend 环境运行常规 GRPO 或 PPO 训练。
+先说 rollout 采样吞吐。
 
-用户在 Ascend NPU 集群上跑 verl，使用 vLLM-Ascend 作为 rollout engine，训练侧定期把 actor 权重同步到 rollout 侧。
+强化学习训练里，rollout 不是辅助环节，它直接影响训练 step 的节奏。如果权重同步期间推理侧长时间暂停，或者样本回流被 Ray RPC 卡住，NPU 的有效利用率就会下降。我们做这套优化，目标不是只让单个函数更快，而是减少推理链路里那些框架层等待时间，让 rollout 尽可能持续地产生有效样本。
 
-这个场景下，用户最关心的是每个 training step 的端到端耗时、rollout generation 耗时、actor update 耗时、权重同步耗时，以及参数同步是否导致 rollout 长时间暂停。
+再说权重同步定位。
 
-我们给这个场景提供的是 L0 和 L1 指标。
+千亿参数或更大模型下，权重同步成本非常敏感。一次同步里面可能包含请求中断、KV cache 清理、通信组构建、权重发送、权重接收、推理引擎更新、恢复生成等多个阶段。以前这些阶段混在一个大耗时里，定位时只能猜。补充 `param_sync/*` 指标后，我们可以看到每个阶段的占比，再决定优化优先级。
 
-L0 是端到端指标，比如 `timing_s/step`、`timing_s/gen`、`timing_s/update_actor`、`timing_s/update_weights`、`perf/throughput`。
+还有 Ray 和序列化链路的框架开销。
 
-L1 是框架链路指标，比如 `param_sync/*`，用于拆解权重同步的每一个阶段。
+fully_async 场景下，样本不是一次性大批量同步返回，而是持续从 rollouter 流向 trainer。如果 trainer 每次只从 Ray Actor 拉一个 sample，RPC 次数会非常高。再叠加 cloudpickle 序列化和反序列化，CPU 侧就可能变成瓶颈。批量 get、后续 queue shard、SampleRef / TransferQueue 都是在解决这个方向的问题。
 
-第二个 use case，是推理性能团队验证某个框架优化是否有效。
+最后是性能验证方法。
 
-比如我们做了 MessageQueue 批量 get、bucket metadata 优化、权重同步策略优化。这个时候不能只说“理论上会更快”，必须能做 A/B 对比。
+推理性能优化必须有 baseline / patched 对比。我们需要同一模型、同一数据、同一配置、同一 step 数下的对比结果，并且能输出 mean、p50、p95、speedup、verdict。这样每个 patch 的收益都能被复现，而不是只靠一次日志截图说明问题。
 
-所以我们提供 `scripts/bench_ascend_verl_timing.py run` 来固定实验参数并落盘，提供 `summarize` 生成 `summary.json` 和 `timing_breakdown.csv`，再提供 `compare` 生成 baseline / patched 对比和优化 verdict。
-
-这就解决了一个关键问题：以后任何优化 patch，都可以用同一套 benchmark 判断收益是否真实存在。
-
-第三个 use case，是 fully_async 短样本高并发采样。
-
-这个场景里 rollouter 持续生成样本并写入 MessageQueue，trainer 异步消费样本并更新 actor。
-
-这里的核心问题不是单个 NPU 算子慢，而是 trainer 等样本、MessageQueue RPC 次数、Ray actor mailbox、GCS 压力，以及 cloudpickle 序列化和反序列化成本。
-
-本方案提供 `get_samples(max_n)` 批量消费接口，并记录 `fully_async/message_queue_get_rpc_count` 和 `fully_async/cloudpickle_load_time`。后续还可以扩展 queue shard 和 SampleRef / TransferQueue。
-
-第四个 use case，是同节点权重传输链路调优。
-
-训练和推理进程部署在同一节点时，rollout 侧可能通过 IPC 或 shared memory fallback 接收权重。这里我们需要知道实际走 IPC 还是 SHM、bucket 数量是多少、总字节数是多少、sender copy 和 receiver clone 成本是多少、metadata 编解码时间是多少。
-
-所以我们给 `BucketedWeightSender` 和 `BucketedWeightReceiver` 都加 stats，然后 benchmark parser 会把这些 stdout 里的统计解析成 `weight_transfer/*` 指标。
-
-再看约束和限制。
-
-第一，Ascend 支持版本必须以实际 recipe 固定 commit 为准。当前设计基线是 `4045d670` 这个 Ascend-supported commit，不能直接把 GitHub main 当成 Ascend 支持版本。
-
-第二，NPU stream 完全重叠不能直接承诺。当前 HCCL engine 虽然有双 buffer，但实际代码里 `BroadcastOperation` 仍然同步执行 ZMQ metadata 和 `pyhccl.broadcast()`，并且有 `torch.npu.synchronize()`。所以能否做到通信流和计算流完全重叠，需要 pyhccl 能力和 profiler 验证。
-
-第三，同节点长期零拷贝权重共享不能作为近期生产承诺。当前已有的是 bucket IPC 传输，不是推理进程长期挂载训练权重。receiver 侧仍可能 clone 或 to device，推理引擎仍有自己的权重副本。
-
-第四，TransferQueue 在当前 commit 中主要是外部集成入口，本地没有完整 in-tree 实现。因此我们可以设计 SampleRef / TransferQueue 方向，但不能说当前代码已经完整具备。
-
-第五，Prefix / KV cache 保留策略正确性敏感。权重版本变化后复用旧 KV cache 可能产生跨权重版本污染，所以默认必须保持保守清理策略。
-
-第六，benchmark 的真实收益必须在 Ascend 环境验证。本地 CPU 测试只能验证 parser、CLI、dry-run 和局部逻辑，不能代替真实 NPU 端到端训练。
+这些价值合在一起，就是这次方案的定位：它既包含近期可落地的框架优化，也为后续更激进的异步权重同步和数据面优化打基础。
 
 ---
 
-## 三、方案设计
+## 现有瓶颈
 
-接下来进入方案设计。
+接下来讲现有瓶颈。这里我不按模块罗列太多概念，而是从训练过程中真正会遇到的几个卡点讲。
 
-整体方案的原则是：可观测性先行、低风险优化优先、异步化分阶段推进。
+先看权重同步。
 
-这里我们把整体架构分成五层。
+当前 `CheckpointEngineManager.update_weights()` 是权重同步编排的核心入口。一次 update 会串行执行很多事情，包括 `abort_all_requests`、sleep、build process group、send / receive / update、finalize、wake，以及 `resume_generation`。
 
-第一层是基线修正层。
+这个流程的优点是语义安全。推理侧先停下来，确认没有旧请求继续跑，然后接收新权重，再恢复生成。这样可以避免很多权重版本不一致的问题。
 
-这一层解决的是“链路要先能正确工作”。最典型的就是修复 HCCL registry，把 `HCCLCheckpointEngine` 的注册 key 修成 `"hccl"`，并增加重复注册告警，避免 NCCL / HCCL backend 静默覆盖。
+但它的问题也很直接：一次权重同步会让推理采样停住，而且所有阶段的成本都叠加在一起。日志里看到 `timing_s/update_weights` 高，并不能直接判断根因。它可能是请求中断慢，可能是 sleep/wake 慢，可能是 process group 初始化慢，也可能是 HCCL send / receive 慢，或者 rollout server 把权重更新到推理引擎时慢。
 
-第二层是指标采集层。
+对于推理优化来说，这种黑盒状态是比较危险的。因为我们不知道该优化通信、调度、缓存、还是推理引擎更新。更重要的是，如果后续想做 `drain_then_commit` 或 `prefetch_then_commit`，也必须先知道当前 `abort_all` 的真实成本分布。
 
-我们在权重同步、bucketed transfer、fully_async queue、cloudpickle load 等关键路径增加 L1 指标。指标来源包括 file logger、stdout log 和 benchmark parser。这样以后不是看一个粗粒度耗时，而是能看每个子环节。
+再看 HCCL backend 的注册问题。
 
-第三层是低风险优化层。
+代码复核时发现，当前基线里 `HCCLCheckpointEngine` 的注册 key 和配置预期不一致。配置和文档里期望的是 `backend=hccl`，但实现里存在注册成 `"nccl"` 的问题。
 
-这一层先做不改变训练语义的优化，比如 MessageQueue 批量 get、权重同步分段计时、bucket transfer 统计。这些改动风险低，但能立刻提升可观测性，并且部分场景下能直接降低 Ray RPC 成本。
+这个问题本身不是一个性能技巧，但它是一个必须先修的可用性问题。如果 HCCL backend 不能通过 `hccl` 正确命中，那么 Ascend 权重同步链路就不可靠。后面无论是 benchmark，还是权重同步策略，都会建立在不稳定的基础上。
 
-第四层是权重同步策略层。
+所以这里的处理方式很明确：先修 registry，把 HCCL engine 注册到 `"hccl"`；同时增加重复注册 warning，避免 NCCL / HCCL backend 静默覆盖。
 
-当前默认仍然保留 `abort_all`，保证生产回退路径不变。后续我们再引入 `drain_then_commit` 和 `prefetch_then_commit`。
+再看同节点权重传输。
 
-`drain_then_commit` 的思路是：先暂停接收新请求，等待正在执行的请求自然 drain，超时后再 abort 少量尾部请求，然后进行权重 commit。
+当前 vLLM rollout 侧已经有 bucketed weight transfer，能够根据环境能力使用 IPC 或 shared memory fallback。这个方向是合理的，因为训练和推理进程在同一台机器上时，确实应该尽量避免不必要的跨进程复制和通信开销。
 
-`prefetch_then_commit` 的思路是：先把新权重预加载到 rollout 侧影子缓存里，不影响当前推理请求；等请求边界或者 stale 阈值触发时，再做短暂停顿，把 READY 状态的新权重 commit 到推理引擎。
+但目前缺少细粒度统计。我们不知道一次传输实际走 IPC 还是 SHM，也不知道 bucket 数量、总字节数、metadata 时间、sender copy 时间、receiver clone 或 to device 时间。这会导致一个很实际的问题：传输慢的时候，我们不知道是路径选错了、bucket 设计不合理，还是接收端处理成本太高。
 
-第五层是 benchmark 验证层。
+这里要特别说明一下，当前代码里的 IPC 传输和我们之前讨论的“长期零拷贝权重共享”不是一回事。当前更接近一次权重传输路径优化，receiver 侧仍然可能产生 clone 或 device copy，推理引擎也通常仍有自己的权重副本。长期显存 IPC 共享是更激进的方向，需要额外验证 ACL IPC handle、生命周期、权限隔离和推理引擎适配，不能直接当成近期可落地方案。
 
-通过 Ascend timing breakdown benchmark 对 baseline 和 patched 做 A/B 对比，输出 `summary.json`、`timing_breakdown.csv` 和 `compare.json`。这一层的作用是让每个优化都能被证明，而不是停留在代码解释。
+再看 fully_async 样本回流。
 
-从数据流看，Trainer 更新 actor 权重后，会通过 `CheckpointEngineManager` 进入 HCCL、IPC 或 SHM 权重同步，再进入 Rollout Server 的 `update_weights`。随后 vLLM-Ascend 或 SGLang 继续做采样，产生 RolloutSample 或后续的 SampleRef，再通过 MessageQueue 或 TransferQueue 回流给 Trainer。整个链路中，权重同步产生 `param_sync` 指标，权重传输产生 `weight_transfer` 指标，样本回流产生 `ray` 和 `serialization` 指标，训练主循环产生 `timing_s` 和 `perf` 指标，最后全部进入 benchmark summary 和 compare。
+fully_async 的设计目标是让 rollout 和 training 尽量解耦。rollouter 持续生成样本，trainer 持续消费样本。理论上这能减少同步等待，但它也会把压力转移到消息队列和数据回流上。
 
-接下来讲影响分析。
+当前 MessageQueue 是单 Ray Actor。trainer 端逐个调用 `get_sample_sync()` 拉样本，rollouter 端把 rollout sample 做 `cloudpickle.dumps()`，trainer 端再 `cloudpickle.loads()`。在样本很多、单个样本不大、rollout replica 多的场景里，RPC 次数和序列化成本会非常明显。
 
-首先是对训练正确性的影响。
+这种瓶颈不在 NPU 算子层，而在框架调度和 CPU 数据处理层。如果只看 NPU profiler，可能看不到完整问题；如果只看 step 时间，也不知道 Ray RPC 占了多少。所以这里需要同时做轻量优化和指标记录。
 
-P0 和 P1 中的 registry 修复、指标打点、MessageQueue 批量 get，原则上不改变训练数学语义。批量 get 只是减少 RPC 次数，不改变样本内容。
+最后是 benchmark 缺口。
 
-但是 `drain_then_commit` 和 `prefetch_then_commit` 会引入权重版本边界，所以必须控制 staleness。样本需要携带 `param_version`，trainer 消费样本时要检查 stale 阈值，commit 失败时不能切换到半更新权重。对于 GRPO，多 response per prompt 的 group normalization 对版本一致性更敏感，所以同一 prompt group 内要尽量保持版本一致。
+目前如果只看训练日志，我们能知道大概哪个大阶段耗时，但没有统一方法把权重同步、bucket transfer、fully_async queue、cloudpickle、端到端 step 放在一张表里对比。这样就很难形成稳定的优化闭环。
 
-其次是对推理服务的影响。
-
-当前 `abort_all` 安全但粗暴，会中断请求并清 cache。`drain_then_commit` 可以降低中断概率，但会增加等待 drain 的逻辑。`prefetch_then_commit` 可以缩短最终 commit 停顿，但需要额外缓存和状态机。
-
-第三是对资源消耗的影响。
-
-指标采集成本较低，但 NPU profiler 会影响运行时性能，所以 profiler 只适合少量 step 抽样。prefetch 和 cache 方案可能增加 HBM 或 CPU pinned memory 占用，所以默认应该限制 `max_cached_versions=1`，并且按 bucket 管理生命周期。
-
-第四是对运维和定位的影响。
-
-这是正向影响。以前遇到性能问题时，我们只能知道 step 变慢。现在通过这些指标，可以判断瓶颈在 Ray / MessageQueue、cloudpickle、HCCL / IPC transfer、rollout server update、vLLM-Ascend generation，还是 actor update。
-
-再看 Use Case 设计里的交互。
-
-主要交互对象有五类：
-
-第一类是算法和训练用户。他们通过 Hydra 参数选择 rollout engine、checkpoint backend、同步策略和 benchmark 参数，关注训练是否跑通，吞吐是否提升，结果是否稳定。
-
-第二类是推理性能优化工程师。他们通过 benchmark runner 跑 baseline 和 patched，对比 L0、L1、L2 指标，判断优化是否有效。
-
-第三类是 Rollout Server。它负责接收权重更新、生成样本、处理 pause、resume、abort 和 commit。
-
-第四类是 CheckpointEngineManager。它是权重同步编排的核心入口，也是后续实现 `drain_then_commit` 和 `prefetch_then_commit` 的关键位置。
-
-第五类是 MessageQueue 和 TransferQueue。它们负责样本从 rollouter 到 trainer 的回流，是 fully_async 场景下的数据面核心。
-
-典型流程是：用户配置 benchmark，benchmark runner 启动 `main_ppo`，trainer 调 rollout 生成样本，rollout 写入 MessageQueue，trainer 批量拉取样本并训练，训练后调用 CheckpointEngineManager 更新权重。训练过程中的 file logger 和 stdout 被 benchmark parser 汇总，最后输出 summary、csv 和 compare verdict。
-
-功能原理可以拆成五个点。
-
-第一个是 HCCL backend 修复。
-
-把 `HCCLCheckpointEngine` 注册 key 从 `"nccl"` 修正为 `"hccl"`，这样配置 `backend=hccl` 时能正确实例化 HCCL engine。
-
-第二个是权重同步分段计时。
-
-我们在 `CheckpointEngineManager.update_weights()` 内部围绕每个阶段记录耗时，形成 `param_sync/*` 指标。这样可以判断同步慢到底是因为 abort、sleep、process group、send/recv、finalize，还是 wake/resume。
-
-第三个是 bucketed transfer 指标。
-
-sender 记录 bucket 数、总字节数、copy 时间、metadata send 时间和 sync 时间；receiver 记录 metadata recv 时间、clone 或 to device 时间、bucket bytes 和 sync 时间。
-
-第四个是 MessageQueue 批量 get。
-
-原来 trainer 每次从 Ray actor 拉一个 sample，现在一次最多拉 `max_n` 个 sample。队列为空时最多等待 timeout，队列关闭时返回 None，遇到 None sentinel 时保留原来的终止语义。
-
-第五个是 benchmark 汇总和对比。
-
-benchmark runner 会从 file logger 收集 `timing_s/*`、`perf/*`、`fully_async/*` 等指标，从 stdout 解析 `param_sync/*` 和 `weight_transfer/*`，最后生成 summary 和 compare。
-
-接下来讲 Story 和 Task 分解。
-
-第一个 Story：作为 Ascend verl 用户，我希望 `backend=hccl` 能正确启动，使 HCCL 权重同步链路可用。
-
-对应任务是修正 HCCL registry，增加 registry 覆盖 warning，并增加 CPU 可执行源码测试或 NPU smoke test。
-
-第二个 Story：作为性能工程师，我希望看到权重同步各阶段耗时，定位同步瓶颈。
-
-对应任务是在 `CheckpointEngineManager.update_weights()` 增加分段 timer，把 `last_update_weights_timing` 写入训练 metrics，并在 benchmark parser 中聚合 `param_sync/*`。
-
-第三个 Story：作为性能工程师，我希望知道权重传输走 IPC 还是 SHM，以及每个 bucket 的 copy 和 metadata 成本。
-
-对应任务是给 `BucketedWeightSender` 和 `BucketedWeightReceiver` 增加 stats，并在 stdout parser 中解析这些 stats。
-
-第四个 Story：作为 fully_async 用户，我希望 trainer 批量消费样本，减少 Ray RPC 开销。
-
-对应任务是给 `MessageQueue` 和 `MessageQueueClient` 增加批量接口，修改 `FullyAsyncTrainer._get_samples_from_queue()` 使用批量 get，并记录 RPC 次数和 cloudpickle load 时间。
-
-第五个 Story：作为优化验证负责人，我希望有统一 benchmark 证明每个 patch 的收益。
-
-对应任务是新增 `scripts/bench_ascend_verl_timing.py`，新增 Ascend 一键运行脚本，支持 `run`、`summarize`、`compare`，并输出 summary、csv 和 compare。
-
-第六个 Story：作为后续优化开发者，我希望可以逐步演进到异步权重同步。
-
-对应任务是设计 `sync_policy`，第一阶段实现 `drain_then_commit`，第二阶段实现 `HCCLCachedCheckpointEngine` 和 `prefetch / commit`，并引入 `param_version` 和 stale sample 控制。
+我们需要一个 Ascend timing breakdown benchmark。它要能运行一组固定实验，收集 metrics 和 stdout，再生成 summary 和 csv。更重要的是，它要支持 compare，用 baseline 和 patched 的结果直接给出收益判断。
 
 ---
 
-## 四、可靠可用设计
+## 需求目标
 
-接下来讲可靠可用设计。
+基于上面的瓶颈，近期目标要收敛到可落地、可验证、风险低的范围内。
 
-首先是冗余设计。
+首先要保证 Ascend HCCL 权重同步链路能正确启用。这里的目标很具体，就是 `backend=hccl` 能命中 `HCCLCheckpointEngine`，并且 registry 出现重复注册时能给出 warning。
 
-第一，同步策略冗余。
+接着要让权重同步链路可观测。我们不再只看一个整体 `update_weights`，而是拆成多个阶段：请求中断、sleep、process group 构建、send / receive / update、finalize、wake、resume generation。这样后续如果同步慢，可以直接看哪个阶段占比最高。
 
-默认保留当前 `abort_all` 路径。`drain_then_commit` 和 `prefetch_then_commit` 都必须作为可配置策略启用。如果新策略异常，可以直接回退到 `abort_all`。
+同节点权重传输也要可观测。sender 侧记录 bucket 数、总字节数、metadata send、copy、sync；receiver 侧记录 metadata recv、clone 或 to device、sync。这样我们能判断 IPC / SHM 传输路径是否符合预期，也能判断接收端是否有额外复制成本。
 
-第二，通信路径冗余。
+fully_async 方向先做批量消费。把 trainer 端逐样本 get 改成 `get_samples(max_n)`，减少 Ray RPC 次数，同时记录 queue get RPC count 和 cloudpickle load time。这个优化不改变样本内容，也不改变训练数学语义，适合作为近期低风险优化。
 
-vLLM rollout 当前已经支持 IPC 和 shared memory fallback。我们优化 IPC 传输时不能移除 SHM fallback。当 Ascend IPC 环境不满足要求时，系统应该自动退回 SHM，并输出 `weight_transfer/path=shm`。
+最后是补齐 benchmark。新增 Ascend timing breakdown benchmark 后，我们可以统一输出 `summary.json`、`timing_breakdown.csv` 和 `compare.json`。这些文件既能用于开发自测，也能用于方案评审和性能收益汇报。
 
-第三，权重版本冗余。
+中长期目标可以继续往异步化和数据面优化推进。
 
-prefetch 阶段不能覆盖当前已 commit 权重。只有新版本完整接收并进入 READY 状态后才允许 commit。如果 commit 失败，继续使用旧版本。
+权重同步可以从当前默认的 `abort_all` 演进到 `drain_then_commit`，再演进到 `prefetch_then_commit`。MessageQueue 可以从单 Actor 变成分片队列。样本回流可以从大对象直接 cloudpickle，演进到 SampleRef 加 TransferQueue，也就是控制面传引用，数据面走更合适的传输路径。ACL IPC buffer 和长期显存共享也可以做 PoC。
 
-第四，benchmark 数据冗余。
-
-我们同时保留 file logger 和 stdout log。即使部分 metrics 没有进入 file logger，也可以从 stdout 里解析权重同步和 bucket transfer 统计。
-
-第五，profiler 冗余。
-
-NPU profiler 只作为 L2 抽样证据，不依赖 profiler 才能完成 benchmark。即使 profiler 失败，L0 和 L1 指标仍然应该可用。
-
-然后是防呆设计。
-
-第一，backend 防呆。
-
-registry 重复注册时输出 warning，避免 HCCL / NCCL backend 被静默覆盖。
-
-第二，配置防呆。
-
-`sync_policy` 默认使用 `abort_all`。高风险策略，比如 `prefetch_then_commit`、prefix cache version 化、ACL IPC PoC，都必须显式开启。
-
-第三，队列防呆。
-
-`get_samples(max_n)` 要校验 `max_n > 0`。队列关闭且为空时返回 None，保留原终止语义。遇到 None sentinel 时停止本次批量 pop，避免吞掉终止信号后的样本。
-
-第四，版本防呆。
-
-stale threshold 必须可配置，超过阈值的样本不能无条件进入训练。GRPO 多 response per prompt 场景下，要避免同一个 prompt group 内混用过多权重版本。
-
-第五，内存防呆。
-
-cached weights 默认只保留最新一个版本，bucket buffer 必须有生命周期释放。大 tensor 分片不能无限制重组，否则容易导致峰值内存翻倍。
-
-第六，benchmark 防呆。
-
-benchmark runner 支持 dry-run，先打印实际 verl 命令、输出路径和 env。这样用户可以确认参数之后再跑真实训练。summary 对缺失字段应该跳过，而不是因为某个指标缺失直接失败。
-
-第七，profiler 防呆。
-
-默认只 profile 少量 step，避免 profiler 对性能数据产生过大扰动。profile step 也应该避开 warmup step。
+但这里必须讲清楚：中长期方向不是近期承诺。它们需要真实 Ascend 环境、vLLM-Ascend 或 SGLang 适配、权重版本控制、cache 生命周期管理和 profiler 验证。近期最稳的路径还是先修正基础链路、补指标、做批量 get、建设 benchmark。
 
 ---
 
-## 五、测试建议
+## 典型场景
 
-最后讲测试建议。
+这个方案主要覆盖四类场景。
 
-测试分六类。
+最基础的是常规 GRPO / PPO 训练。
 
-第一类是单元测试。
+用户在 Ascend 集群上跑 verl，使用 vLLM-Ascend 作为 rollout engine。训练侧更新 actor，rollout 侧周期性接收新权重并继续生成样本。这个场景下，用户最关心的是 step 是否稳定，rollout 生成是否被频繁打断，权重同步有没有占用过多时间。
 
-HCCL registry 测试要验证 HCCL backend 注册为 `"hccl"`，并且不会覆盖 `"nccl"`。
+这里我们提供两层指标。端到端层面看 `timing_s/step`、`timing_s/gen`、`timing_s/update_actor`、`timing_s/update_weights` 和 `perf/throughput`。框架链路层面看 `param_sync/*`，把权重同步内部拆开。这样用户能先判断整体是否变快，再判断变快或变慢的原因。
+
+另一个场景，是推理性能团队做 patch 验证。
+
+比如我们做了 MessageQueue 批量 get，或者后续改了 bucket metadata，或者实现了新的同步策略。评审时不能只说“理论上少了一些 RPC，所以应该更快”。更合理的方式是用同一套 benchmark 跑 baseline 和 patched，然后看 compare 输出。
+
+这个场景下，benchmark 的价值不只是跑一次训练，而是让优化收益有统一口径。比如 MessageQueue 优化就看 RPC 次数、queue wait 和 cloudpickle 时间；权重同步优化就看 `param_sync/*`；bucket transfer 优化就看 sender / receiver 的 copy 和 metadata 时间。
+
+还有 fully_async 短样本高并发。
+
+在这种场景里，NPU 算子不一定是瓶颈。rollouter 生成速度快，trainer 消费频繁，如果每个 sample 都触发一次 Ray RPC，再加上 cloudpickle 序列化，框架侧成本会被放大。批量 `get_samples(max_n)` 就是先解决这个问题。后续如果单 Actor mailbox 仍然是瓶颈，再考虑 queue shard。
+
+再往下，是同节点权重传输调优。
+
+训练和推理进程部署在同一台机器上时，我们希望尽量利用本地更低成本的传输路径。当前已经有 bucket IPC / SHM 能力，但缺少统计。我们先把路径、bucket、bytes、metadata、copy、sync 都打出来，再决定后续是否需要优化 bucket size、减少 clone，或者做 ACL IPC buffer PoC。
+
+这四类场景覆盖了近期最实际的需求：训练能跑、性能可测、瓶颈可定位、优化可验证。
+
+---
+
+## 约束和边界
+
+这里需要把边界说清楚，否则方案容易被理解成所有想法都能马上上线。
+
+首先，Ascend 支持版本要以实际 recipe 固定 commit 为准。这次设计基线是 Ascend-supported 的 `4045d670`。不能直接把 GitHub main 当成 Ascend 支持版本，因为 main 上的 verl 代码、vLLM 适配、checkpoint engine、fully_async 实现都可能和 Ascend recipe 不一致。
+
+其次，NPU stream 完全重叠不能直接承诺。
+
+我们之前讨论过异步权重同步和后台通信流，比如 `torch_npu.npu.Stream()`。这个方向有价值，但当前 HCCL engine 实现里仍然有 ZMQ metadata、`pyhccl.broadcast()` 和 `torch.npu.synchronize()`。这些同步点会影响通信和计算能否真正重叠。也就是说，能不能做到“训练器后台广播新权重，推理侧继续跑旧权重”，必须用 pyhccl 能力和 NPU profiler 验证，不能只凭设计假设。
+
+同节点零拷贝权重共享也要谨慎。
+
+当前代码支持的是 bucketed IPC 或 shared memory 权重传输，不是推理进程直接长期挂载训练进程的权重显存。真正基于 `aclrtIpcOpenMemHandle` 的长期显存共享，需要处理显存句柄生命周期、跨进程权限、Ray RPC 元数据传递、推理引擎权重对象绑定、以及训练侧权重更新时的一致性问题。这个方向可以研究，但近期不能把它作为生产承诺。
+
+TransferQueue 也类似。它适合作为后续把大 tensor 从 Ray cloudpickle 数据面移出去的方向，但当前 commit 里没有完整 in-tree 实现。所以近期方案里可以写设计和接口预留，不能说当前已经完整支持。
+
+还有 prefix / KV cache 的问题。权重更新后继续复用旧 KV cache，可能带来跨权重版本污染。尤其 RL 训练里，样本质量和权重版本有关，如果旧 cache 和新权重混用，正确性风险很高。因此默认策略应该保守，先清 cache。只有后续有明确的 cache version 机制，才考虑更激进的保留策略。
+
+最后，性能收益必须在真实 Ascend 环境验证。本地 CPU 测试可以证明代码路径、parser、dry-run 和单元逻辑没问题，但不能证明 NPU 通信、vLLM-Ascend rollout 或 HCCL 性能收益。
+
+---
+
+## 整体方案
+
+整体方案的原则是：可观测性先行，低风险优化优先，异步化分阶段推进。
+
+这句话拆开来看，就是先不要直接改最高风险路径。我们先把当前链路看清楚，知道每个阶段耗时多少；再做不改变训练语义的优化；等 benchmark 能证明瓶颈和收益后，再往更激进的异步权重同步、数据面优化推进。
+
+从架构上看，可以拆成几层能力。
+
+最底层是基线修正。
+
+这一层解决的是“链路必须先正确工作”。HCCL backend registry 就属于这一层。修复后，`backend=hccl` 能正确实例化 `HCCLCheckpointEngine`。同时 registry 重复注册时给 warning，避免 HCCL / NCCL 这类 backend 被静默覆盖。
+
+往上一层是指标采集。
+
+这一层负责把黑盒拆开。权重同步产生 `param_sync/*` 指标，bucket transfer 产生 `weight_transfer/*` 指标，fully_async queue 产生 RPC 和等待相关指标，cloudpickle 产生序列化相关指标。训练主循环继续保留 `timing_s/*` 和 `perf/*`。
+
+这套指标的重点不是越多越好，而是每个指标都要能回答一个定位问题。比如 `param_sync/build_process_group_ms` 用来判断通信组构建是否异常；`weight_transfer/receiver_copy_ms` 用来判断接收端复制是否过高；`fully_async/message_queue_get_rpc_count` 用来判断批量 get 是否真的减少了 RPC。
+
+再往上是近期低风险优化。
+
+这里优先做 MessageQueue 批量 get。因为它不改变样本内容，也不改变 trainer 的训练逻辑，只是把多次单样本 RPC 合并成一次批量 RPC。在短样本、高并发、fully_async 场景下，这个优化的收益路径很清楚：减少 Ray Actor 调用次数，降低 mailbox 和 GCS 压力，减少 trainer 等样本的碎片化开销。
+
+接下来是权重同步策略。
+
+当前默认仍然保留 `abort_all`。原因很简单，它虽然粗，但语义安全。后续可以新增 `sync_policy`，先支持 `drain_then_commit`，再支持 `prefetch_then_commit`。
+
+`drain_then_commit` 的思路是，在权重 commit 前先暂停接收新请求，让正在执行的请求自然完成。如果超过 drain timeout，还有尾部请求没有完成，再做有限 abort。这样可以减少每次同步时粗暴中断大量请求的情况。
+
+`prefetch_then_commit` 的思路更进一步。训练侧产生新权重后，先把新权重预加载到 rollout 侧影子缓存里。当前推理请求仍然用旧权重继续跑。等到请求边界、batch 边界或 stale 阈值满足后，再做一次短 commit，把 READY 状态的新权重切到推理引擎里。
+
+这个方向理论上能缩短最终暂停时间，但它需要额外的状态机。比如权重版本要有 `RECEIVING`、`READY`、`COMMITTED`、`FAILED` 这些状态；commit 失败时要继续使用旧权重；样本要能携带 `param_version`；trainer 要能识别 stale sample。它不是不能做，而是要分阶段做。
+
+最上面是 benchmark 验证。
+
+这里新增 Ascend timing breakdown benchmark。它负责三件事：运行训练、汇总指标、对比结果。运行阶段固定模型、数据、step 和关键配置；汇总阶段生成 `summary.json` 和 `timing_breakdown.csv`；对比阶段生成 `compare.json`，输出 speedup、delta 和 verdict。
+
+从完整数据流看，Trainer 更新 actor 权重后，通过 `CheckpointEngineManager` 进入 HCCL、IPC 或 SHM 权重同步；Rollout Server 接收权重并更新推理引擎；vLLM-Ascend 或 SGLang 继续生成样本；样本通过 MessageQueue 或后续 TransferQueue 回流给 Trainer；整个过程中，file logger 和 stdout log 持续记录指标；benchmark parser 最后把这些指标汇总成可对比结果。
+
+这个设计的好处是，每个模块都有明确职责。权重同步负责可控更新，MessageQueue 负责样本回流，benchmark 负责证明收益，配置开关负责控制风险。
+
+---
+
+## 关键模块设计
+
+下面把几个关键模块展开讲一下。
+
+先讲 HCCL backend 修复。
+
+这个改动很小，但优先级很高。我们要把 `HCCLCheckpointEngine` 正确注册到 `"hccl"`。同时 registry 里如果发现同一个 key 被重复注册，要输出 warning。这样一方面保证 Ascend 配置能正确命中 HCCL，另一方面也避免未来新增 backend 时出现静默覆盖。
+
+这个模块的验收标准也比较清楚：配置 `backend=hccl` 时能拿到 HCCL engine；配置 `backend=nccl` 时不受影响；重复注册时有明确日志提示。
+
+再讲权重同步分段计时。
+
+我们在 `CheckpointEngineManager.update_weights()` 内部加 timer，不改变原有流程，只记录每个阶段耗时。这里的关键是不要只记录总耗时，而是要把阶段边界和实际业务动作对齐。
+
+比如 abort 阶段对应请求中断；sleep 阶段对应等待 rollout engine 进入安全状态；build process group 对应通信组构建；send / receive / update 对应权重传输和推理引擎更新；finalize 对应同步收尾；wake 和 resume 对应恢复生成。
+
+这些指标最后写到 `last_update_weights_timing`，再由 trainer 主循环写入 metrics。benchmark parser 读取后聚合成 `param_sync/*`。
+
+这样做的收益不是立即改变性能，而是让性能问题可解释。比如如果 `build_process_group_ms` 很高，优化方向可能是复用通信组；如果 `send_recv_update_ms` 很高，优化方向可能是 bucket、HCCL 或 IPC；如果 `resume_generation_ms` 很高，优化方向可能在 rollout engine 恢复逻辑。
+
+再讲 bucketed weight transfer stats。
+
+sender 侧要记录本次传输使用的路径、bucket 数、总字节数、metadata send 时间、copy 时间和 sync 时间。receiver 侧要记录 metadata recv 时间、clone 或 to device 时间、sync 时间和接收字节数。
+
+这里要注意 sender 和 receiver 都要记录。只看 sender 不够，因为接收端 clone 或 device copy 也可能是主要成本；只看 receiver 也不够，因为 metadata 编码、bucket 发送和同步也可能在 sender 侧。
+
+这些 stats 可以先通过 stdout 打出来，再由 benchmark parser 解析。后续如果 file logger 支持更自然，也可以统一进入 metrics。
+
+再讲 MessageQueue 批量 get。
+
+原来的模式是 trainer 每次拉一个 sample。新的模式是 trainer 调用 `get_samples(max_n)`，一次最多拉一批。队列为空时可以等待 timeout，队列关闭且为空时返回 None，遇到 None sentinel 时保留原来的终止语义。
+
+这个设计的关键是兼容原语义。它不能因为批量化就吞掉结束信号，也不能改变样本顺序。对 trainer 来说，拿到的是一组样本，但每个样本本身仍然保持原来的结构和内容。
+
+指标上，我们需要记录两类数据：拉取样本时实际发生了多少次 Ray RPC，以及 cloudpickle load 花了多少时间。这样 benchmark 对比时可以直接看到批量 get 有没有降低 RPC，以及 CPU 反序列化是不是仍然是瓶颈。
+
+再讲 benchmark。
+
+benchmark 脚本需要支持 `run`、`summarize` 和 `compare`。
+
+`run` 负责启动 verl 训练，把 stdout、stderr、metrics 和环境信息落盘。  
+`summarize` 负责从日志里解析指标，生成 `summary.json` 和 `timing_breakdown.csv`。  
+`compare` 负责比较 baseline 和 patched，给出每个关键指标的变化。
+
+这里的设计重点是让 benchmark 可以被开发者重复使用。它不能只服务一次汇报，而是要成为后续优化 patch 的标准验证入口。
+
+---
+
+## 交互流程
+
+从用户视角看，整个使用流程比较直接。
+
+算法或训练用户仍然通过 Hydra 配置运行 verl。比如选择 rollout engine、checkpoint backend、是否启用 fully_async、是否启用某个 sync policy。默认情况下，高风险策略不打开，系统仍然走保守路径。
+
+推理性能工程师会多做一步：使用 benchmark runner 固定实验参数，分别跑 baseline 和 patched。跑完后不直接看零散日志，而是看 summary、csv 和 compare。
+
+一个典型流程是这样的。
+
+先准备模型和数据，比如 Qwen 系列模型、train parquet 和 validation parquet。然后设置 `MODEL_PATH`、`TRAIN_FILES`、`VAL_FILES` 和 `OUTPUT_DIR`，启动 Ascend timing breakdown benchmark。
+
+训练开始后，trainer 正常拉起 rollout workers。rollout engine 生成样本，样本进入 MessageQueue。trainer 批量拉取样本后训练 actor。actor 更新后，trainer 调用 `CheckpointEngineManager.update_weights()`，把新权重同步到 rollout 侧。
+
+在这个过程中，权重同步阶段会写 `param_sync/*`，bucket transfer 会写 `weight_transfer/*`，fully_async queue 会写 RPC 和 cloudpickle 指标，训练主循环会写 `timing_s/*` 和 `perf/*`。
+
+跑完 baseline 后，再用相同模型、相同数据、相同 step 数跑 patched。最后执行 compare。compare 输出里如果显示 step 时间下降、吞吐上升，同时对应子指标也下降，比如 MessageQueue RPC count 降低，那我们就能解释这个 patch 的收益来源。
+
+这套交互的重点是减少人为判断。以前可能需要人工翻日志，现在希望 benchmark 输出就能给出大部分判断依据。
+
+---
+
+## 影响分析
+
+从训练正确性看，近期改动风险比较低。
+
+HCCL registry 修复只是让 backend 正确命中，不改变训练数学逻辑。权重同步和 bucket transfer 的指标打点只增加观测，不改变原有流程。MessageQueue 批量 get 也只是把多次 get 合并成一次，不改变样本内容和训练计算。
+
+需要重点关注的是后续异步权重同步。
+
+一旦从 `abort_all` 走向 `drain_then_commit` 或 `prefetch_then_commit`，系统里就会出现权重版本边界。rollout 样本最好携带 `param_version`，trainer 消费时要判断 stale 程度。尤其是 GRPO 这种一个 prompt 对应多个 response 的场景，如果同一个 group 里混入过多权重版本，可能影响 group normalization 的一致性。
+
+从推理服务影响看，默认保守路径必须保留。也就是说，新策略不能一上线就替换所有场景，而是要通过配置显式启用。出现异常时，可以直接回退到 `abort_all`。
+
+从资源消耗看，普通指标打点开销很低，可以默认开启。但 NPU profiler 会影响性能，所以只适合少量 step 抽样。prefetch 和 cached weights 会增加 HBM 或 CPU pinned memory 占用，因此后续缓存设计必须有上限，比如默认只保留一个待提交版本。
+
+从运维定位看，这套方案会带来明显改善。以前定位性能问题主要靠大阶段日志，现在可以把问题分到 Ray / MessageQueue、cloudpickle、HCCL / IPC、rollout server update、generation、actor update 等具体方向。定位路径更短，优化优先级也更容易判断。
+
+---
+
+## 可靠可用设计
+
+可靠性设计主要围绕回退、版本、防呆和观测冗余展开。
+
+同步策略上，默认保留当前 `abort_all`。这是生产稳定性的兜底路径。`drain_then_commit` 和 `prefetch_then_commit` 都作为可配置策略存在。只要新策略出现异常，系统可以直接回退。
+
+通信路径上，IPC 优化不能移除 shared memory fallback。Ascend IPC 环境不满足时，要自动退回 SHM，并且把实际传输路径写到指标里。这样既不影响可用性，也方便后续判断为什么性能没有达到预期。
+
+权重版本上，prefetch 不能覆盖当前已经 commit 的权重。新版本必须完整接收，并进入 READY 状态后，才允许 commit。如果接收失败、校验失败或 commit 失败，推理侧继续使用旧版本，不能进入半更新状态。
+
+样本版本上，异步策略必须引入 stale 控制。超过阈值的样本不能无条件进入训练。GRPO 多 response per prompt 的场景下，还要尽量保证同一个 prompt group 内版本一致，至少要记录版本分布，避免后续问题无法定位。
+
+内存管理上，cached weights 和 bucket buffer 都要有明确生命周期。不能因为追求异步化，让权重缓存无限增长。默认可以限制 `max_cached_versions=1`，后续根据真实收益再扩大。
+
+队列接口上，`get_samples(max_n)` 要校验 `max_n > 0`。队列关闭且为空时返回 None，遇到 None sentinel 时保留终止语义，不能因为批量 pop 把结束信号吞掉。
+
+benchmark 上要保留 dry-run。用户可以先确认真实命令、输出目录和环境变量，再启动真实训练。summary 对缺失字段要尽量容错，某些可选指标缺失时不应该直接失败，而是标记为缺失。
+
+观测上同时保留 file logger 和 stdout log。这样即使某些指标短期内没有进入统一 metrics，也可以从 stdout 解析出权重同步和 bucket transfer 统计，保证 benchmark 能继续工作。
+
+---
+
+## 测试建议
+
+测试建议分成四层：单元测试、开发者本地测试、Ascend 集成测试和 A/B 性能测试。
+
+单元测试主要覆盖局部逻辑。
+
+HCCL registry 测试要验证 HCCL backend 注册为 `"hccl"`，并且不会覆盖 `"nccl"`。重复注册时应该有 warning。
 
 MessageQueue 批量 get 测试要覆盖正常批量返回、timeout 返回空 batch、None sentinel 终止语义、shutdown 后返回 None，以及 `max_n <= 0` 抛错。
 
-Bucketed transfer stats schema 测试要验证 sender 和 receiver 默认 stats 字段完整，避免后续改代码时误删指标 key。
+Bucketed transfer stats 测试要验证 sender 和 receiver 的 stats schema 完整。这样后续改代码时，如果误删字段，测试能及时发现。
 
-Benchmark parser 测试要构造 fake `metrics.jsonl` 和 `stdout.log`，验证 `timing_s/*` 聚合、`param_sync/*` 解析、`weight_transfer/*` 解析，以及 mean、p50、p95、pct_of_step_mean 计算正确。
+Benchmark parser 测试要构造 fake `metrics.jsonl` 和 `stdout.log`，验证 `timing_s/*`、`param_sync/*`、`weight_transfer/*` 的解析，以及 mean、p50、p95、pct_of_step_mean 的计算。
 
-Compare 测试要构造 baseline 和 patched summary，验证 speedup、delta 和 effective verdict 正确。
+Compare 测试要构造 baseline 和 patched summary，验证 speedup、delta 和 verdict 是否符合预期。
 
-第二类是开发者本地测试。
+开发者本地测试主要证明代码路径可跑。
 
-在没有 Ascend 环境的情况下，至少要跑 Python 语法编译、benchmark parser 测试、MessageQueue CPU 测试、bucket stats schema 测试，以及 `run_ascend_timing_breakdown_bench.sh --dry-run`。
+在没有 Ascend 环境的机器上，可以跑 CPU 单元测试、benchmark parser 测试、MessageQueue 测试、bucket stats schema 测试，以及 `run_ascend_timing_breakdown_bench.sh --dry-run`。
 
-本地测试的目标不是证明 NPU 性能收益，而是证明代码可以运行、parser 正确、命令构造正确、指标字段没有明显问题。
+这里要明确，本地测试不能证明 NPU 性能收益。它只能证明代码没有语法问题，命令能正确构造，parser 能正确汇总，新增接口没有破坏原语义。
 
-第三类是 Ascend 集成测试。
-
-在真实 Ascend 环境里执行：
+Ascend 集成测试要在真实环境跑。典型命令是：
 
 ```bash
 MODEL_PATH=/path/to/model \
@@ -358,59 +354,34 @@ OUTPUT_DIR=outputs/ascend_timing_breakdown/baseline \
 bash tests/special_npu/run_ascend_timing_breakdown_bench.sh
 ```
 
-跑完后要检查 `metrics.jsonl`、`stdout.log`、`summary.json`、`timing_breakdown.csv` 和 `npu_profile`。
+跑完后检查 `metrics.jsonl`、`stdout.log`、`summary.json`、`timing_breakdown.csv` 和可选的 `npu_profile`。基本通过标准是：`summary.json` 里 `step_count > 0`，csv 里有 `timing_s/step`，stdout 能看到 checkpoint 或 bucket transfer 统计。如果配置了 profiler step，还要检查 profile 目录里是否有采集文件。
 
-通过标准是：`summary.json` 里 `step_count > 0`，`timing_breakdown.csv` 包含 `timing_s/step`，stdout 中能看到 checkpoint 或 bucket transfer 统计，配置了 profile step 时 `npu_profile` 有采集文件。
+A/B 性能测试是证明优化收益的关键。
 
-第四类是 A/B 性能测试。
+同一套模型、同一份数据、同一组参数、同样 step 数，分别跑 baseline 和 patched。对比时不要只看一个总耗时，而是看端到端和子指标是否一致。
 
-这个是证明优化收益的核心。同一环境、同一模型、同一数据、同一 step 数，分别跑 baseline 和 patched，然后执行 compare。
+端到端看 `perf/throughput` 是否提升，`timing_s/step` 是否下降。MessageQueue 优化看 RPC count 是否下降。权重同步优化看 `param_sync/send_recv_update_ms` 和 `timing_s/update_weights` 是否下降。bucket transfer 优化看 sender / receiver copy 和 metadata 时间。序列化优化看 cloudpickle load 时间。
 
-重点看四类指标：
+除了性能，还要做正确性回归。至少要确认单 step smoke test 能完成，多 step GRPO / PPO 的 loss、reward、KL 没有 NaN 或 Inf，权重同步后 rollout 能继续生成，fully_async 模式下 stale sample 比例符合阈值。
 
-端到端看 `perf/throughput` 是否提升、`timing_s/step` 是否下降。
-
-MessageQueue 优化看 `ray/message_queue_get_rpc_count` 是否下降。
-
-权重同步优化看 `param_sync/send_recv_update_ms` 和 `timing_s/update_weights` 是否下降。
-
-bucket transfer 优化看 `weight_transfer/sender_copy_ms`、`weight_transfer/receiver_copy_ms`、`metadata_send_ms`、`metadata_recv_ms` 是否下降。
-
-序列化优化看 `serialization/cloudpickle_load_s` 是否下降。
-
-第五类是正确性回归测试。
-
-性能优化不能只看耗时，还要验证训练行为没有被破坏。至少要保证单 step smoke test 能完成，多 step GRPO / PPO 的 loss、reward、KL 没有 NaN 或 Inf，权重同步后 rollout 能继续生成，fully_async 模式下 stale sample 比例符合阈值，启用优化和关闭优化时样本字段完整性一致。
-
-第六类是压力测试。
-
-建议至少覆盖小模型、中模型、长 response、高 rollout_n 和多节点。
-
-小模型比如 Qwen2.5-0.5B，用于快速回归。中模型比如 Qwen2.5-7B 或 Qwen3-8B，用于真实吞吐观察。长 response 用来观察 decode 和 queue 压力。高 rollout_n 用来观察 MessageQueue 和样本序列化压力。多节点用来观察 Ray GCS、HCCL process group 和权重同步稳定性。
+压力测试建议覆盖小模型、中模型、长 response、高 rollout_n 和多节点。小模型用于快速回归，中模型用于真实吞吐观察，长 response 看 decode 和 queue 压力，高 rollout_n 看 MessageQueue 和序列化压力，多节点看 Ray GCS、HCCL process group 和权重同步稳定性。
 
 ---
 
-## 六、总结收口
+## 总结
 
 最后总结一下。
 
-这套方案的核心，不是直接承诺某个高风险优化一定带来多少收益，而是先把 verl Ascend 推理优化做成一个可度量、可回退、可迭代的工程体系。
+这套方案的重点不是把所有高风险想法一次性落到生产链路，而是先搭一个能持续优化的工程闭环。
 
-近期我们优先做四件事：
+近期最值得做的是四件事：修 HCCL backend，补权重同步和 bucket transfer 指标，做 MessageQueue 批量 get，再用 Ascend timing breakdown benchmark 做 baseline / patched 对比。
 
-第一，修正 HCCL backend，保证 Ascend 权重同步链路正确可用。
+这些事情的共同特点是风险可控，而且能直接提升可观测性。即使某些优化没有立刻带来明显吞吐提升，它们也能告诉我们真正瓶颈在哪里，为后续优化提供依据。
 
-第二，把权重同步、bucket transfer、MessageQueue 和 cloudpickle 的关键耗时都打出来。
+中长期可以继续推进更激进的方向，包括 `drain_then_commit`、`prefetch_then_commit`、MessageQueue 分片、SampleRef / TransferQueue，以及 ACL IPC buffer PoC。但这些方向必须建立在权重版本、缓存生命周期、失败回退和 profiler 验证都足够清楚的基础上。
 
-第三，做低风险优化，比如 MessageQueue 批量 get，减少 Ray RPC。
+所以这次方案的落地原则很明确：默认路径保守，优化路径可配置，收益用 benchmark 证明，风险用回退机制控制。
 
-第四，构建 Ascend timing breakdown benchmark，用 baseline / patched 的方式证明优化收益。
-
-中长期再逐步推进 `drain_then_commit`、`prefetch_then_commit`、MessageQueue 分片、SampleRef + TransferQueue，以及 ACL IPC buffer PoC。
-
-这里最重要的工程原则是：默认路径保守，优化路径可配置，收益用 benchmark 证明，风险用回退机制控制。
-
-这样我们既能面向推理性能团队交付有价值的框架层优化，也能保证不会因为过度追求性能而破坏 RL 训练链路的正确性和稳定性。
+这样我们既能面向推理性能团队交付有价值的框架层优化，也能避免为了追求局部性能破坏 RL 训练链路的正确性和稳定性。
 
 我的串讲到这里结束。
-
