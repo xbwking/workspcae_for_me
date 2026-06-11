@@ -35,7 +35,13 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
-from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+try:
+    from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+except ModuleNotFoundError:
+
+    class AbstractCurriculumSampler:  # type: ignore[no-redef]
+        pass
+
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
