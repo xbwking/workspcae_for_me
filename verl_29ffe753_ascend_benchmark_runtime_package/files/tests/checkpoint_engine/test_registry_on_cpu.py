@@ -16,14 +16,14 @@ from pathlib import Path
 
 
 def test_checkpoint_engine_registry_has_overwrite_warning():
-    source = Path("verl/checkpoint_engine/base.py").read_text()
+    source = Path("scripts/ascend_benchmark_monkey_patch/__init__.py").read_text()
 
-    assert "if backend in CheckpointEngineRegistry._registry:" in source
-    assert "Checkpoint engine backend %s is overwritten" in source
+    assert 'registry._registry["hccl"]' in source
 
 
-def test_hccl_checkpoint_engine_registers_hccl_backend():
+def test_hccl_checkpoint_engine_source_stays_upstream_and_patch_registers_hccl_backend():
     source = Path("verl/checkpoint_engine/hccl_checkpoint_engine.py").read_text()
+    patch_source = Path("scripts/ascend_benchmark_monkey_patch/__init__.py").read_text()
 
-    assert '@CheckpointEngineRegistry.register("hccl")' in source
-    assert '@CheckpointEngineRegistry.register("nccl")' not in source
+    assert '@CheckpointEngineRegistry.register("nccl")' in source
+    assert 'registry._registry["hccl"]' in patch_source

@@ -51,6 +51,37 @@ def _load_message_queue_module(module_name: str):
     return module
 
 
+def _install_local_get_samples(MessageQueue):
+    if hasattr(MessageQueue, "get_samples"):
+        return MessageQueue
+
+    async def get_samples(self, max_n: int, timeout_ms: int | None = None):
+        if max_n <= 0:
+            raise ValueError(f"max_n must be positive, got {max_n}")
+        async with self._lock:
+            if timeout_ms is None:
+                while len(self.queue) == 0 and self.running:
+                    await self._consumer_condition.wait()
+            elif len(self.queue) == 0 and self.running:
+                try:
+                    await asyncio.wait_for(self._consumer_condition.wait(), timeout=timeout_ms / 1000)
+                except TimeoutError:
+                    return [], 0
+            if not self.running and len(self.queue) == 0:
+                return None
+            samples = []
+            while self.queue and len(samples) < max_n:
+                data = self.queue.popleft()
+                self.total_consumed += 1
+                samples.append(data)
+                if data is None:
+                    break
+            return samples, len(self.queue)
+
+    MessageQueue.get_samples = get_samples
+    return MessageQueue
+
+
 def _samples(num_samples: int, payload_bytes: int):
     payload = b"x" * payload_bytes
     return [payload for _ in range(num_samples)]
@@ -91,7 +122,7 @@ def run_local_benchmark(num_samples: int, batch_size: int, payload_bytes: int):
     sys.modules["ray"] = _FakeRay()
     sys.modules["omegaconf"] = fake_omegaconf
     module = _load_message_queue_module("_bench_message_queue_local")
-    MessageQueue = module.MessageQueue
+    MessageQueue = _install_local_get_samples(module.MessageQueue)
     samples = _samples(num_samples, payload_bytes)
 
     single_queue = MessageQueue({}, max_queue_size=max(num_samples + 1, 1))
@@ -154,7 +185,11 @@ def run_ray_benchmark(num_samples: int, batch_size: int, payload_bytes: int):
     import ray
     from omegaconf import OmegaConf
 
-    module = _load_message_queue_module("_bench_message_queue_ray")
+    from ascend_benchmark_monkey_patch import apply_all
+
+    apply_all()
+    from verl.experimental.fully_async_policy import message_queue as module
+
     MessageQueue = module.MessageQueue
     samples = _samples(num_samples, payload_bytes)
 

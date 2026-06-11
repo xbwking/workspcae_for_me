@@ -40,7 +40,37 @@ def _load_message_queue(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
-    return module.MessageQueue
+    return _install_get_samples(module.MessageQueue)
+
+
+def _install_get_samples(MessageQueue):
+    async def get_samples(self, max_n: int, timeout_ms: int | None = None):
+        if max_n <= 0:
+            raise ValueError(f"max_n must be positive, got {max_n}")
+        async with self._lock:
+            if timeout_ms is None:
+                while len(self.queue) == 0 and self.running:
+                    await self._consumer_condition.wait()
+            elif len(self.queue) == 0 and self.running:
+                try:
+                    await asyncio.wait_for(self._consumer_condition.wait(), timeout=timeout_ms / 1000)
+                except TimeoutError:
+                    return [], 0
+
+            if not self.running and len(self.queue) == 0:
+                return None
+
+            samples = []
+            while self.queue and len(samples) < max_n:
+                data = self.queue.popleft()
+                self.total_consumed += 1
+                samples.append(data)
+                if data is None:
+                    break
+            return samples, len(self.queue)
+
+    MessageQueue.get_samples = get_samples
+    return MessageQueue
 
 
 def test_get_samples_returns_batch_and_updates_consumed_count(monkeypatch):

@@ -157,8 +157,7 @@ def test_run_dry_run_builds_ascend_benchmark_command(tmp_path):
 
     assert payload["env"]["VERL_FILE_LOGGER_PATH"].endswith("metrics.jsonl")
     assert "python3" in payload["command"][0]
-    assert "-m" in payload["command"]
-    assert "verl.trainer.main_ppo" in payload["command"]
+    assert "scripts/run_ppo_with_ascend_benchmark_patches.py" in payload["command"]
     assert "trainer.device=npu" in payload["command"]
     assert "trainer.logger=['file','console']" in payload["command"]
     assert "global_profiler.tool=npu" in payload["command"]
@@ -200,9 +199,97 @@ def test_summarize_cli_writes_report_files(tmp_path):
     assert csv_path.exists()
 
 
-def test_trainer_logs_checkpoint_manager_param_sync_breakdown():
+def test_report_cli_builds_readable_outputs_from_run_dir(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "npu_profile").mkdir()
+    (run_dir / "npu_profile" / "trace.json").write_text("{}")
+    (run_dir / "metrics.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "step": 1,
+                        "data": {
+                            "timing_s/step": 10.0,
+                            "timing_s/gen": 6.0,
+                            "timing_s/update_actor": 2.0,
+                            "perf/throughput": 100.0,
+                            "fully_async/message_queue_get_rpc_count": 3,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "step": 2,
+                        "data": {
+                            "timing_s/step": 12.0,
+                            "timing_s/gen": 7.0,
+                            "timing_s/update_actor": 2.5,
+                            "perf/throughput": 110.0,
+                            "fully_async/message_queue_get_rpc_count": 2,
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    (run_dir / "stdout.log").write_text(
+        "CheckpointEngineManager.update_weights timing: "
+        "{'param_sync/total_ms': 100.0, 'param_sync/send_recv_update_ms': 80.0}\n"
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/report_ascend_verl_timing.py",
+            "--run-dir",
+            str(run_dir),
+            "--top-n",
+            "4",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    outputs = json.loads(completed.stdout)
+    report_md = Path(outputs["markdown"])
+    report_json = Path(outputs["json"])
+    top_csv = Path(outputs["csv"])
+
+    assert report_md.exists()
+    assert report_json.exists()
+    assert top_csv.exists()
+    md = report_md.read_text()
+    assert "Ascend verl Benchmark 一页式报告" in md
+    assert "`timing_s/gen`" in md
+    assert "`param_sync/send_recv_update_ms`" in md
+    payload = json.loads(report_json.read_text())
+    assert payload["step_count"] == 2
+    assert payload["artifacts"]["npu_profile"]["file_count"] == 1
+    assert "param_sync/send_recv_update_ms" in top_csv.read_text()
+
+
+def test_benchmark_cli_keeps_report_out_of_main_script():
+    completed = subprocess.run(
+        [sys.executable, "scripts/bench_ascend_verl_timing.py", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "{run,summarize,compare}" in completed.stdout
+    assert "report" not in completed.stdout
+
+
+def test_benchmark_uses_monkey_patches_without_editing_verl_sources():
     ppo_source = Path("verl/trainer/ppo/ray_trainer.py").read_text()
     fully_async_source = Path("verl/experimental/fully_async_policy/fully_async_trainer.py").read_text()
+    patch_source = Path("scripts/ascend_benchmark_monkey_patch/__init__.py").read_text()
 
-    assert "last_update_weights_timing" in ppo_source
-    assert "last_update_weights_timing" in fully_async_source
+    assert "last_update_weights_timing" not in ppo_source
+    assert "message_queue_get_rpc_count" not in fully_async_source
+    assert "last_update_weights_timing" in patch_source
+    assert "message_queue_get_rpc_count" in patch_source

@@ -315,8 +315,7 @@ def build_run_command(args: argparse.Namespace) -> tuple[dict[str, str], list[st
 
     command = [
         args.python,
-        "-m",
-        "verl.trainer.main_ppo",
+        "scripts/run_ppo_with_ascend_benchmark_patches.py",
         "algorithm.adv_estimator=grpo",
         f"data.train_files={args.train_files}",
         f"data.val_files={args.val_files}",
@@ -474,6 +473,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     compare_parser.add_argument("--baseline-summary", type=Path, required=True)
     compare_parser.add_argument("--patched-summary", type=Path, required=True)
     compare_parser.add_argument("--output", type=Path, required=True)
+
     return parser.parse_args(argv)
 
 

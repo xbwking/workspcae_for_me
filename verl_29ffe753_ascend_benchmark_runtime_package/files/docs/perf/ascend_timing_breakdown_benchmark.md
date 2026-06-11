@@ -5,6 +5,16 @@ It captures end-to-end step timing, framework timing, parameter-sync timing, Ray
 
 ## Run One Benchmark
 
+The benchmark runs verl through a non-invasive monkey-patch wrapper:
+
+```text
+scripts/run_ppo_with_ascend_benchmark_patches.py
+```
+
+The wrapper enables runtime instrumentation for the benchmark process and Ray
+workers.  It does not require editing upstream verl source files such as
+`ray_trainer.py`, `checkpoint_engine/base.py`, or `message_queue.py`.
+
 ```bash
 MODEL_PATH=/path/to/model \
 TRAIN_FILES=/path/to/train.parquet \
@@ -21,6 +31,48 @@ outputs/ascend_timing_breakdown/baseline/stdout.log
 outputs/ascend_timing_breakdown/baseline/summary.json
 outputs/ascend_timing_breakdown/baseline/timing_breakdown.csv
 outputs/ascend_timing_breakdown/baseline/npu_profile
+```
+
+## Build A One-Page Report
+
+Keep the raw artifacts above, then generate a readable report from the run directory:
+
+```bash
+python3 scripts/report_ascend_verl_timing.py \
+  --run-dir outputs/ascend_timing_breakdown/baseline
+```
+
+This writes:
+
+```text
+outputs/ascend_timing_breakdown/baseline/report.md
+outputs/ascend_timing_breakdown/baseline/report.json
+outputs/ascend_timing_breakdown/baseline/top_metrics.csv
+```
+
+The report tool is intentionally separated from `scripts/bench_ascend_verl_timing.py`.
+The benchmark script owns collection, summarization, and baseline/patched comparison.
+The report script only reads existing artifacts and builds a human-readable view.
+This keeps the two code paths easy to review and merge independently.
+
+Use `report.md` for quick reading. It contains:
+
+```text
+结论视图：timing_s/step、perf/throughput
+Step 耗时主项：生成、reward、log_prob、actor update、update_weights 等占比
+参数同步 / 权重传输：param_sync/*、weight_transfer/*
+Ray / 序列化 / 异步队列：ray/*、serialization/*、fully_async/*
+产物索引：metrics.jsonl、stdout.log、summary.json、timing_breakdown.csv、npu_profile 是否存在和大小
+缺失指标：本次运行没有采集到的关键指标
+```
+
+If `summary.json` does not exist, the report command rebuilds it from `metrics.jsonl` and `stdout.log`:
+
+```bash
+python3 scripts/report_ascend_verl_timing.py \
+  --run-dir outputs/ascend_timing_breakdown/baseline \
+  --warmup-steps 2 \
+  --measured-steps 3,4,5,6,7,8
 ```
 
 ## Compare Baseline and Patched Runs
