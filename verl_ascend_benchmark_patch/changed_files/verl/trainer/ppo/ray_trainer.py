@@ -72,7 +72,17 @@ from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
-from verl.utils.rollout_skip import RolloutSkip
+try:
+    from verl.utils.rollout_skip import RolloutSkip
+except ModuleNotFoundError:
+
+    class RolloutSkip:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "actor_rollout_ref.rollout.skip.enable=True requires verl.utils.rollout_skip, "
+                "but this verl version does not provide it. Disable rollout skip or copy verl/utils/rollout_skip.py."
+            )
+
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
