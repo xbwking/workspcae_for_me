@@ -1,22 +1,40 @@
 # Benchmark Quickstart
 
-完整 verl Ascend 耗时拆解 benchmark：
+## 当前推荐版本
+
+你当前镜像里的 verl commit 是：
 
 ```text
-verl_ascend_benchmark_patch/changed_files/scripts/bench_ascend_verl_timing.py
+29ffe753600ceca3cc5530ee6166be77fb4ecc1c
 ```
 
-推荐入口：
+请使用：
 
 ```text
-verl_ascend_benchmark_patch/changed_files/tests/special_npu/run_ascend_timing_breakdown_bench.sh
+verl_29ffe753_benchmark_patch/
 ```
 
-最小运行：
+不要把旧的 `verl_ascend_benchmark_patch/` 整份覆盖到该镜像版本。
+
+## 应用 patch
+
+在目标 verl 仓库根目录执行：
 
 ```bash
-cd /path/to/verl
+cp -R /path/to/verl_29ffe753_benchmark_patch/changed_files/* .
+```
 
+## 最小验证
+
+```bash
+python3 -m py_compile   scripts/bench_ascend_verl_timing.py   verl/trainer/ppo/ray_trainer.py   verl/checkpoint_engine/base.py
+
+MODEL_PATH=/models/qwen TRAIN_FILES=/data/train.parquet VAL_FILES=/data/test.parquet OUTPUT_DIR=/tmp/verl_29ffe753_bench_dry_run bash tests/special_npu/run_ascend_timing_breakdown_bench.sh --dry-run
+```
+
+## 正式运行
+
+```bash
 MODEL_PATH=/path/to/model TRAIN_FILES=/path/to/train.parquet VAL_FILES=/path/to/test.parquet OUTPUT_DIR=outputs/ascend_timing_breakdown/baseline bash tests/special_npu/run_ascend_timing_breakdown_bench.sh
 ```
 
@@ -25,12 +43,12 @@ MODEL_PATH=/path/to/model TRAIN_FILES=/path/to/train.parquet VAL_FILES=/path/to/
 ```text
 summary.json
 timing_breakdown.csv
-compare.json
 stdout.log
 npu_profile/
 ```
 
-详细说明见：
+## A/B 对比
 
-- [docs/verl_ascend_timing_breakdown_benchmark_user_manual.md](docs/verl_ascend_timing_breakdown_benchmark_user_manual.md)
-- [verl_ascend_benchmark_patch/benchmark_user_manual.md](verl_ascend_benchmark_patch/benchmark_user_manual.md)
+```bash
+python3 scripts/bench_ascend_verl_timing.py compare   --baseline-summary outputs/ascend_timing_breakdown/baseline/summary.json   --patched-summary outputs/ascend_timing_breakdown/patched/summary.json   --output outputs/ascend_timing_breakdown/compare.json
+```
