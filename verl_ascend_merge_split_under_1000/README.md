@@ -1,12 +1,12 @@
 # verl Ascend Benchmark Merge Split
 
-这个目录用于两个人分别提交代码，每次合入不超过 1000 行。
+这个目录用于两个人分别提交代码。功能代码按每次合入不超过 1000 行拆分，UT 单文件均小于 1000 行。
 
 ## PR1: Benchmark
 
 目录：`pr1_benchmark_under_1000/`
 
-行数：
+功能代码行数：
 
 ```text
 147  docs/perf/ascend_timing_breakdown_benchmark.md
@@ -21,16 +21,26 @@
 
 ```text
 完整 benchmark
-不带测试
+包含 UT，单个测试文件均小于 1000 行
 不修改 verl/ 源码
 不包含 report 工具
+```
+
+UT 行数：
+
+```text
+118  tests/unit/test_ascend_timing_cli.py
+149  tests/unit/test_ascend_timing_summary.py
+ 78  tests/unit/test_message_queue_micro_bench.py
+---
+345 行
 ```
 
 ## PR2: Report Tool
 
 目录：`pr2_report_tool_under_1000/`
 
-行数：
+功能代码行数：
 
 ```text
 168  README.md
@@ -48,6 +58,28 @@
 不修改 verl/ 源码
 可单独安装到 verl 仓库
 读取 metrics.jsonl/stdout.log，输出 report.md/report.json/top_metrics.csv
+```
+
+UT 行数：
+
+```text
+196  tests/unit/test_report_tool.py
+```
+
+## UT 运行
+
+```bash
+cd pr1_benchmark_under_1000
+python3 -m pytest tests/unit -q
+
+cd ../pr2_report_tool_under_1000
+python3 -m pytest tests/unit -q
+```
+
+如果环境没有 pytest，至少可以做语法和 CLI 冒烟验证：
+
+```bash
+python3 -m py_compile scripts/*.py tests/unit/*.py
 ```
 
 ## 合入顺序

@@ -2,38 +2,23 @@
 
 当前用于代码合入的最终目录：`verl_ascend_merge_split_under_1000/`
 
-这个目录把 Ascend benchmark 和 report 工具拆成两个 PR，每次合入都控制在 1000 行以内，并且都不包含 `verl/` 源码侵入式修改。
+这个目录把 Ascend benchmark 和 report 工具拆成两个 PR。功能代码按每次合入不超过 1000 行拆分，UT 单文件均小于 1000 行，并且都不包含 `verl/` 源码侵入式修改。
 
 ## PR1 Benchmark
 
 ```text
 verl_ascend_merge_split_under_1000/pr1_benchmark_under_1000/
-990 行
-```
-
-包含完整 benchmark：
-
-```text
-scripts/bench_ascend_verl_timing.py
-scripts/bench_fully_async_message_queue.py
-tests/special_npu/run_ascend_timing_breakdown_bench.sh
-docs/perf/ascend_timing_breakdown_benchmark.md
+功能代码 990 行
+UT 345 行，单文件均小于 1000 行
 ```
 
 ## PR2 Report Tool
 
 ```text
 verl_ascend_merge_split_under_1000/pr2_report_tool_under_1000/
-728 行
-```
-
-包含独立 report 工具：
-
-```text
-scripts/ascend_verl_timing_report.py
-scripts/report_ascend_verl_timing.py
-README.md
-install_into_verl.sh
+功能代码 728 行
+UT 196 行
+总计 924 行
 ```
 
 压缩包：`verl_ascend_merge_split_under_1000.tar.gz`
