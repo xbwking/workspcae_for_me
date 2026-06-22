@@ -18,6 +18,9 @@ SCRIPT = ROOT / "scripts" / "bench_ascend_verl_timing.py"
 WRAPPER = ROOT / "tests" / "special_npu" / "run_ascend_timing_breakdown_bench.sh"
 
 
+def run_command(argv, **kwargs):
+    return subprocess.run(argv, shell=False, **kwargs)
+
 def load_bench_module():
     spec = importlib.util.spec_from_file_location("_bench_ascend_verl_timing_cli_ut", SCRIPT)
     module = importlib.util.module_from_spec(spec)
@@ -28,7 +31,7 @@ def load_bench_module():
 
 class AscendTimingCliDryRunTest(unittest.TestCase):
     def run_dry_run(self, tmpdir, *extra_args):
-        completed = subprocess.run(
+        completed = run_command(
             [
                 sys.executable,
                 str(SCRIPT),
@@ -116,7 +119,7 @@ class AscendTimingSubprocessCliTest(unittest.TestCase):
                 "{'param_sync/total_ms': 100.0, 'param_sync/send_recv_update_ms': 80.0}\n"
             )
 
-            completed = subprocess.run(
+            completed = run_command(
                 [
                     sys.executable,
                     str(SCRIPT),
@@ -153,7 +156,7 @@ class AscendTimingSubprocessCliTest(unittest.TestCase):
             baseline.write_text(json.dumps({"metrics": {"timing_s/step": {"mean": 10.0}}}))
             patched.write_text(json.dumps({"metrics": {"timing_s/step": {"mean": 5.0}}}))
 
-            completed = subprocess.run(
+            completed = run_command(
                 [
                     sys.executable,
                     str(SCRIPT),
@@ -228,7 +231,7 @@ class AscendTimingShellWrapperTest(unittest.TestCase):
     def test_shell_wrapper_dry_run_passes_env_and_overrides(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
-            completed = subprocess.run(
+            completed = run_command(
                 [
                     "bash",
                     str(WRAPPER),

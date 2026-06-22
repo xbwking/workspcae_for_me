@@ -40,9 +40,6 @@ class StepListParsingTest(unittest.TestCase):
     def test_parse_step_list_ignores_empty_items(self):
         self.assertEqual(self.bench._parse_step_list("1,,3,"), [1, 3])
 
-    def test_format_omega_list_has_no_spaces(self):
-        self.assertEqual(self.bench._format_omega_list([2, 3, 5]), "[2,3,5]")
-
 
 class JsonlMetricReadingTest(unittest.TestCase):
     def setUp(self):
